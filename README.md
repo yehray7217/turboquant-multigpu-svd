@@ -150,13 +150,13 @@ $$
 接著使用 QJL 對 residual 做一個低成本 sketch：
 
 $$
-q = \operatorname{sign}(Gr)
+q = \mathrm{sign}(Gr)
 $$
 
 其中：
 
 - $G$ 為隨機投影矩陣；
-- $\operatorname{sign}(\cdot)$ 將結果壓成 1-bit sign code；
+- $\mathrm{sign}(\cdot)$ 將結果壓成 1-bit sign code；
 - $q$ 為 residual 的 QJL correction code。
 
 因此，最終傳輸內容不只是 TurboQuant 的主量化碼，而是：
