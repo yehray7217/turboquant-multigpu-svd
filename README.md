@@ -137,27 +137,27 @@ TurboQuant 因此加入第二階段：
 
 令：
 
-\[
+$$
 \hat{x}_{\text{TQ}}
-\]
+$$
 
 表示 TurboQuant 第一階段量化後的近似重建，則 residual 為：
 
-\[
+$$
 r = x - \hat{x}_{\text{TQ}}
-\]
+$$
 
 接著使用 QJL 對 residual 做一個低成本 sketch：
 
-\[
+$$
 q = \operatorname{sign}(Gr)
-\]
+$$
 
 其中：
 
-- \(G\) 為隨機投影矩陣；
-- \(\operatorname{sign}(\cdot)\) 將結果壓成 1-bit sign code；
-- \(q\) 為 residual 的 QJL correction code。
+- $G$ 為隨機投影矩陣；
+- $\operatorname{sign}(\cdot)$ 將結果壓成 1-bit sign code；
+- $q$ 為 residual 的 QJL correction code。
 
 因此，最終傳輸內容不只是 TurboQuant 的主量化碼，而是：
 
@@ -220,49 +220,49 @@ Intermediate Vector / Block x
 
 給定輸入矩陣：
 
-\[
+$$
 A \in \mathbb{R}^{m \times n}
-\]
+$$
 
-目標是近似求得 rank-\(k\) SVD：
+目標是近似求得 rank-$k$ SVD：
 
-\[
+$$
 A \approx U_k \Sigma_k V_k^T
-\]
+$$
 
 其中流程可包含：
 
 1. 產生隨機投影矩陣：
-   \[
-   \Omega \in \mathbb{R}^{n \times (k+p)}
-   \]
+   $$
+\Omega \in \mathbb{R}^{n \times (k+p)}
+$$
 
 2. 各 GPU 計算局部投影：
-   \[
-   Y_i = A_i \Omega
-   \]
+   $$
+Y_i = A_i \Omega
+$$
 
-3. 彙整或交換中間矩陣 \(Y_i\)，形成投影空間資訊；
+3. 彙整或交換中間矩陣 $Y_i$，形成投影空間資訊；
 
 4. 進行 QR 分解：
-   \[
-   Y = QR
-   \]
+   $$
+Y = QR
+$$
 
 5. 計算低維矩陣：
-   \[
-   B = Q^T A
-   \]
+   $$
+B = Q^T A
+$$
 
-6. 對 \(B\) 做 SVD：
-   \[
-   B = \tilde{U} \Sigma V^T
-   \]
+6. 對 $B$ 做 SVD：
+   $$
+B = \tilde{U} \Sigma V^T
+$$
 
 7. 回推出：
-   \[
-   U = Q\tilde{U}
-   \]
+   $$
+U = Q\tilde{U}
+$$
 
 ### 優化前資料流
 
@@ -375,16 +375,16 @@ Input Matrix A
 ## 3. 數值指標
 
 - Reconstruction error：
-  \[
-  \frac{\|A - U_k\Sigma_kV_k^T\|_F}{\|A\|_F}
-  \]
+  $$
+\frac{\|A - U_k\Sigma_kV_k^T\|_F}{\|A\|_F}
+$$
 
 - Singular value relative error：
-  \[
-  \frac{\|\sigma - \hat{\sigma}\|_2}{\|\sigma\|_2}
-  \]
+  $$
+\frac{\|\sigma - \hat{\sigma}\|_2}{\|\sigma\|_2}
+$$
 
-- Reduced matrix \(B\) approximation error
+- Reduced matrix $B$ approximation error
 - Projection quality
 - 若實作允許，可額外比較 inner-product distortion
 
@@ -407,10 +407,10 @@ Input Matrix A
 
 ## 目標 rank
 
-- \(k = 32\)
-- \(k = 64\)
-- \(k = 128\)
-- \(k = 256\)
+- $k = 32$
+- $k = 64$
+- $k = 128$
+- $k = 256$
 
 ## 傳輸格式
 
