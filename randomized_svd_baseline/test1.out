@@ -1,0 +1,61 @@
+--------------------------------
+loading CUDA 12.8 with cuDNN / NCCL
+based on cuda_12.8.0_570.86.10_linux.run
+--------------------------------
+
+Starting Randomized Multi-GPU SVD Benchmark
+Date: Wed May 20 10:02:38 CST 2026
+=====================================
+Running: M=4096 N=2048 K=64 OVERSAMPLE=16 NGPUS=2
+Randomized multi-GPU SVD baseline
+  m=4096 n=2048 k=64 oversample=16 l=80 ngpus=2
+  reconstruction_error_time_ms=1194.78
+
+Timings (ms)
+  init_host_random          165.961
+  local_projection_Yi       232.128
+  gather_Y_fp32             0.693984
+  qr_Y_on_gpu0              5.26563
+  build_B_QtA_on_gpu0       0.308332
+  svd_B_on_gpu0             175.525
+  form_Uk_QUtilde_on_gpu0   0.040258
+  subtotal_reported         579.922
+
+Communication baseline
+  gathered_tensor           Y = A * Omega
+  fp32_payload_bytes        1310720
+  fp32_payload_MiB          1.25
+
+Leading singular values
+  1.35766, 1.34626, 1.34122, 1.32902, 1.32553, 1.32295, 1.31854, 1.31293, 1.31184, 1.30838
+
+Relative Frobenius reconstruction error
+  ||A - Uk Sk Vk^T||_F / ||A||_F = 1.02329
+-------------------------------------
+Running: M=8192 N=4096 K=128 OVERSAMPLE=32 NGPUS=2
+Randomized multi-GPU SVD baseline
+  m=8192 n=4096 k=128 oversample=32 l=160 ngpus=2
+  reconstruction_error_time_ms=10931.6
+
+Timings (ms)
+  init_host_random          661.547
+  local_projection_Yi       273.731
+  gather_Y_fp32             5.6927
+  qr_Y_on_gpu0              17.5402
+  build_B_QtA_on_gpu0       0.991824
+  svd_B_on_gpu0             69.5703
+  form_Uk_QUtilde_on_gpu0   0.066655
+  subtotal_reported         1029.14
+
+Communication baseline
+  gathered_tensor           Y = A * Omega
+  fp32_payload_bytes        5242880
+  fp32_payload_MiB          5
+
+Leading singular values
+  1.35251, 1.34627, 1.34437, 1.34142, 1.33763, 1.33347, 1.33226, 1.32983, 1.3286, 1.32557
+
+Relative Frobenius reconstruction error
+  ||A - Uk Sk Vk^T||_F / ||A||_F = 1.02372
+-------------------------------------
+Benchmark Complete!
