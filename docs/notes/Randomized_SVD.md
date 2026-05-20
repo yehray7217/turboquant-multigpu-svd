@@ -2,13 +2,27 @@
 
 ## Low-rank Approximation
 
-有些情境下（例如具有規律的圖片、）一個矩陣會有很多接近 0 的 singular value。這些病態的 singular value（極度接近 0）對應到現實情境下通常是噪聲。
+有些情境下（例如具有規律的圖片）一個矩陣會有很多接近 0 的 singular value。這些病態的 singular value（極度接近 0）對應到現實情境下通常是噪聲。
 
 因此實務上（圖片壓縮、機器學習的 PCA）通常都是做 truncated SVD（將 singular value 由大排到小，並且只保留前面特定比例的 singular values）。
 
 > ![](./img/low_rank_approximation.webp)
 > Ref: https://www.youtube.com/watch?v=xy3QyyhiuY4
 
+下圖示範了 truncated SVD 在圖片壓縮的應用。我們從 `scikit-learn` 抓取了隨機 15 張大小 $250 \times 250$ 灰階照片。並為每張灰階照片畫出其對應的 singular value spectrum。
+
+![](./img/singular_value_spectrum_image.png)
+
+定義保留前 $k$ 個 singular values 的 energy ratio 為：
+$$
+\frac{\sum_{i=1}^{k}\sigma_i^2}{\sum_{i=1}^{n}\sigma_i^2}
+$$
+
+我們選擇了保留 99.9% 的 energy，效果如下圖。每張圖片的 `k` 對應的是所需的前 `k` 大 singular values。
+
+![](./img/image_svd_compression.png)
+
+可以發現，即使只使用了約 $\frac{1}{8}$ 部分的 singular values，照片的輪廓依舊非常清晰。
 
 
 
