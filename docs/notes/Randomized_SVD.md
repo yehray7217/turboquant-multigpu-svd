@@ -44,7 +44,7 @@ A_k = \sigma_1 u_1 v^T_1 + \sigma_2 u_2 v^T_2 + \cdots + \sigma_k u_k v^T_k
 
 定義兩個矩陣差值的 Frobenius norm：
 ```math
-||A - B||_F = \sqrt{\sum_{i = 1}^{m}\sum_{j = 1}^{n} |a_{ij} - b_{ij}|^2}
+\lVert A - B \rVert_F = \sqrt{\sum_{i = 1}^{m}\sum_{j = 1}^{n} |a_{ij} - b_{ij}|^2}
 ```
 
 Eckart-Young Theorem：$A$ 的最佳 rank-$k$ approximation（使 Frobenius norm 最小）就是 truncated SVD。
@@ -75,17 +75,17 @@ Intuition：利用隨機矩陣讓 $A$ 的 dominant column vectors 浮出來，�
 B = Q^T A
 ```
 6. **對小矩陣 $B$ 做 full SVD**
-   ```math
-   B = \tilde{U} \Sigma V^T
-   ```
+```math
+B = \tilde{U} \Sigma V^T
+```
 7. **把 $\tilde{U}$ 映射回原空間**
-   ```math
-   U = Q \tilde{U}
-   ```
+```math
+U = Q \tilde{U}
+```
 8. **只保留前 $k$ 個 singular values / vectors**
-   ```math
-   A \approx U_k \Sigma_k V_k^T
-   ```
+```math
+A \approx U_k \Sigma_k V_k^T
+```
 
 > 操作成本從「直接對 $m \times n$ 的 $A$ 做 SVD」變成：
 > - 計算 $Y = A\Omega$：$O(mnl)$
@@ -153,10 +153,10 @@ Randomized SVD 的誤差主要來自 $Q$ 是否準確捕捉 $A$ 的 dominant col
 
 常用的檢查方式是 reconstruction error：
 ```math
-\frac{|| A - U_k \Sigma_k V_k^T ||_F}{|| A ||_F}
+\frac{\lVert A - U_k \Sigma_k V_k^T \rVert_F}{\lVert A \rVert_F}
 ```
 
-其中 $|| \cdot ||_F$ 是 Frobenius norm。
+其中 $\lVert \cdot \rVert_F$ 是 Frobenius norm。
 
 
 

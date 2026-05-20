@@ -376,12 +376,12 @@ Input Matrix A
 
 - Reconstruction error：
   ```math
-  \frac{\|A - U_k\Sigma_kV_k^T\|_F}{\|A\|_F}
+  \frac{\lVert A - U_k\Sigma_kV_k^T \rVert_F}{\lVert A \rVert_F}
   ```
 
 - Singular value relative error：
   ```math
-  \frac{\|\sigma - \hat{\sigma}\|_2}{\|\sigma\|_2}
+  \frac{\lVert \sigma - \hat{\sigma} \rVert_2}{\lVert \sigma \rVert_2}
   ```
 
 - Reduced matrix $B$ approximation error
