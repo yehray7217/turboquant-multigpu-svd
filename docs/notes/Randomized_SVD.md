@@ -71,9 +71,9 @@ Intuition：利用隨機矩陣讓 $A$ 的 dominant column vectors 浮出來，�
     - 這步是對 $Y$ 做 QR 分解。
     - 這裡的 $Q \in \mathbb{R}^{m \times l}$ 就是低維 subspace 的 orthonormal basis。
 5. **將 $A$ 投影到這個 subspace**
-   ```math
-   B = Q^T A
-   ```
+```math
+B = Q^T A
+```
 6. **對小矩陣 $B$ 做 full SVD**
    ```math
    B = \tilde{U} \Sigma V^T
