@@ -14,9 +14,9 @@
 ![](./img/singular_value_spectrum_image.png)
 
 定義保留前 $k$ 個 singular values 的 energy ratio 為：
-$$
+```math
 \frac{\sum_{i=1}^{k}\sigma_i^2}{\sum_{i=1}^{n}\sigma_i^2}
-$$
+```
 
 我們選擇了保留 99.9% 的 energy，效果如下圖。每張圖片的 `k` 對應的是所需的前 `k` 大 singular values。
 
@@ -29,23 +29,23 @@ $$
 ### Definition
 
 將 $A$ 做 SVD：
-$$
+```math
 A = U \Sigma V^T
-$$
+```
 其中 $\sigma_1 \geq \sigma_2 \geq \cdots \geq \sigma_n$ 是 $A$ 的 singular values，$u_i, v_i$ 分別是對應的第 $i$ 個 left, right singular vector。
 
 則 $A$ 的 Truncated SVD：
-$$
+```math
 A_k = \sigma_1 u_1 v^T_1 + \sigma_2 u_2 v^T_2 + \cdots + \sigma_k u_k v^T_k
-$$
+```
 
 
 ### Accuracy 
 
 定義兩個矩陣差值的 Frobenius norm：
-$$
+```math
 ||A - B||_F = \sqrt{\sum_{i = 1}^{m}\sum_{j = 1}^{n} |a_{ij} - b_{ij}|^2}
-$$
+```
 
 Eckart-Young Theorem：$A$ 的最佳 rank-$k$ approximation（使 Frobenius norm 最小）就是 truncated SVD。
 
@@ -71,21 +71,21 @@ Intuition：利用隨機矩陣讓 $A$ 的 dominant column vectors 浮出來，�
     - 這步是對 $Y$ 做 QR 分解。
     - 這裡的 $Q \in \mathbb{R}^{m \times l}$ 就是低維 subspace 的 orthonormal basis。
 5. **將 $A$ 投影到這個 subspace**
-   $$
+   ```math
    B = Q^T A
-   $$
+   ```
 6. **對小矩陣 $B$ 做 full SVD**
-   $$
+   ```math
    B = \tilde{U} \Sigma V^T
-   $$
+   ```
 7. **把 $\tilde{U}$ 映射回原空間**
-   $$
+   ```math
    U = Q \tilde{U}
-   $$
+   ```
 8. **只保留前 $k$ 個 singular values / vectors**
-   $$
+   ```math
    A \approx U_k \Sigma_k V_k^T
-   $$
+   ```
 
 > 操作成本從「直接對 $m \times n$ 的 $A$ 做 SVD」變成：
 > - 計算 $Y = A\Omega$：$O(mnl)$
@@ -102,9 +102,9 @@ Intuition：利用隨機矩陣讓 $A$ 的 dominant column vectors 浮出來，�
 ### Power Iteration
 
 為了減小誤差，可將 $Y$ 改成
-$$
+```math
 Y = (AA^T)^q A \Omega
-$$
+```
 
 $q$ 常見取 $1$ 或 $2$。實作時通常不會真的計算 $AA^T$，而是反覆做：
 ```text
@@ -114,9 +114,9 @@ Repeat q times:
 ```
 
 Power iteration 的 intuition：若 $A$ 的 singular values 是 $\sigma_1, \sigma_2, \cdots$，經過 $(AA^T)^q A$ 後，對應權重會變成：
-$$
+```math
 \sigma_i^{2q+1}
-$$
+```
 大的 singular values 會被放得更大，因此 dominant subspace 會更容易被抓出來。
 
 ### Pseudocode
@@ -152,9 +152,9 @@ return U[:, 1:k], Sigma[1:k, 1:k], Vt[1:k, :]
 Randomized SVD 的誤差主要來自 $Q$ 是否準確捕捉 $A$ 的 dominant column space。若 $A$ 的 singular values 下降很快，前 $k$ 個 singular values 已經能解釋大部分能量，則 randomized SVD 通常能得到接近 truncated SVD 的結果。
 
 常用的檢查方式是 reconstruction error：
-$$
+```math
 \frac{|| A - U_k \Sigma_k V_k^T ||_F}{|| A ||_F}
-$$
+```
 
 其中 $|| \cdot ||_F$ 是 Frobenius norm。
 

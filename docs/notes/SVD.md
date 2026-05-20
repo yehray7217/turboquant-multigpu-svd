@@ -17,9 +17,9 @@ $n \times n$ 矩陣 $Q$ 是正交矩陣 $\iff$ $Q$ 的所有 column vectors 標�
 Eigenvector 指的是在某個線性變換下，行為表現得像單純拉伸的向量。Eigenvalue 是縮放倍率。
 
 一個 $n \times n$ 的矩陣 $A$，若對於某個非 $0$ 向量 $v (\neq 0)$ 滿足：
-$$
+```math
 Av = \lambda v
-$$
+```
 
 則稱 $\lambda$ 是 $A$ 的其中一個 eigenvalue，$v$ 是 $A$ 的其中一個 eigenvector。
 
@@ -29,11 +29,12 @@ $$
 ### 2. 對角化
 
 若 $n \times n$ 矩陣 $A$ 的 $n$ 個 eigenvectors 線性獨立，則可以將 $A$ 對角化：
-$$
+```math
 A = P D P^{-1}
-$$
+```
 其中
-$$D = \begin{bmatrix}
+```math
+D = \begin{bmatrix}
 \lambda_1 &  &  &  \\
  & \lambda_2 &  &  \\
  &  & \ddots &  \\
@@ -44,7 +45,7 @@ P = \begin{bmatrix}
 v_1 & v_2 & \cdots & v_n \\
 \ \vert & \ \vert & & \ \vert \
 \end{bmatrix}
-$$
+```
 
 
 
@@ -64,10 +65,10 @@ $n \times n$ 的矩陣 $M$ 是對稱矩陣 $\iff$ $M_{ij} = M_{ji}$ for all $1 \
 ## Singular Value Decomposition
 
 任何一個 $m \times n$ 的矩陣 $A$ 都可以分解成如下：
-$$
+```math
 A = U \Sigma V^T\\
 (\mathbb{R}^{m \times n} = \mathbb{R}^{m \times m} \ \mathbb{R}^{m \times n} \ \mathbb{R}^{n \times n} )
-$$
+```
 
 其中 $U, V$ 皆是正交矩陣，$\Sigma$ 是對角矩陣，對角線上的元素 $\sigma_1, \sigma_2, \cdots, \sigma_{\min(m, n)}$ 是 $A$ 的 singular values。
 
@@ -96,5 +97,4 @@ $$
   </p>
 - `cusolverDnSgesvdj`：Jacobi SVD
 - Randomized SVD
-
 
