@@ -88,7 +88,7 @@ A \approx U_k \Sigma_k V_k^T
 ```
 
 > 操作成本從「直接對 $m \times n$ 的 $A$ 做 SVD」變成：
-> - 計算 $Y = A\Omega$：$O(mnl)$
+> - 計算 $Y = A\Omega$ ($O(mnl)$)
 > - 對 tall-skinny matrix $Y \in \mathbb{R}^{m \times l}$ 做 QR：$O(ml^2)$
 > - 計算 $B = Q^T A$：$O(mnl)$
 > - 對小矩陣 $B \in \mathbb{R}^{l \times n}$ 做 SVD：$O(nl^2)$
