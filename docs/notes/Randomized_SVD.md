@@ -139,10 +139,10 @@ Randomized SVD 的誤差主要來自 $Q$ 是否準確捕捉 $A$ 的 dominant col
 
 常用的檢查方式是 reconstruction error：
 $$
-\frac{\lVert A - U_k \Sigma_k V_k^T \rVert_F}{\lVert A \rVert_F}
+\frac{|| A - U_k \Sigma_k V_k^T ||_F}{|| A ||_F}
 $$
 
-其中 $\lVert \cdot \rVert_F$ 是 Frobenius norm。這個值越小，代表低秩近似越接近原矩陣。
+其中 $|| \cdot ||_F$ 是 Frobenius norm。
 
 
 
