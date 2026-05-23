@@ -3,3 +3,17 @@
 test*.png
 test*.jpg
 test*.webp
+
+cusolver/cusolver
+cusolver/*_%j.out
+cusolver/*_%j.err
+cusolver/*.out
+cusolver/*.err
+
+randomized_svd_baseline/randomized_svd_multigpu
+randomized_svd_baseline/*.out
+randomized_svd_baseline/*.err
+
+randomized_svd_baseline_v2/randomized_svd_multigpu_v2
+randomized_svd_baseline_v2/*.out
+randomized_svd_baseline_v2/*.err
