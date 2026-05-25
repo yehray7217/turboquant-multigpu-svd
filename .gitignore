@@ -20,6 +20,9 @@ randomized_svd_baseline/*.err
 randomized_svd_baseline_v2/randomized_svd_multigpu_v2
 randomized_svd_baseline_v2/*.out
 randomized_svd_baseline_v2/*.err
+randomized_svd_baseline_v2/*.nsys-rep
+randomized_svd_baseline_v2/*.ncu-rep
+randomized_svd_baseline_v2/*.sqlite
 
 # Local SLATE dependency/build artifacts from slate_baseline setup
 third_party/slate-src/
