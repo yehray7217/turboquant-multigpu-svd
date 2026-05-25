@@ -5,11 +5,12 @@ LIBS = -lcublas -lcusolver -lcudart
 
 TARGET = randomized_svd_multigpu_v2
 SRC = randomized_svd_multigpu_v2.cu
+TQ_SRC = ../turboquant/turboquant.cu
 
 all: $(TARGET)
 
-$(TARGET): $(SRC)
-	$(NVCC) $(CFLAGS) $(SRC) -o $(TARGET) $(LIBS)
+$(TARGET): $(SRC) $(TQ_SRC) ../turboquant/turboquant.hpp
+	$(NVCC) $(CFLAGS) $(SRC) $(TQ_SRC) -o $(TARGET) $(LIBS)
 
 clean:
 	rm -f $(TARGET)

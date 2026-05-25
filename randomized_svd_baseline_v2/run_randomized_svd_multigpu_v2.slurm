@@ -25,6 +25,20 @@ CONFIGS=(
     "8192 4096 128 32 2"
 )
 
+# Compression configurations: MODE BITS QJL_DIM QJL_ALPHA
+COMPRESS_CONFIGS=(
+    "none 0 0 0.0"
+    "lowbit 8 0 0.0"
+    "lowbit 4 0 0.0"
+    "lowbit 2 0 0.0"
+    "tq 8 0 0.0"
+    "tq 4 0 0.0"
+    "tq 2 0 0.0"
+    "tq-qjl 8 64 0.01"
+    "tq-qjl 4 64 0.01"
+    "tq-qjl 2 64 0.01"
+)
+
 echo "Starting Randomized Multi-GPU SVD v2 Benchmark"
 echo "Date: $(date)"
 echo "Host: $(hostname)"
@@ -34,14 +48,22 @@ echo "====================================="
 for config in "${CONFIGS[@]}"
 do
     read -r M N K OVERSAMPLE NGPUS <<< "$config"
-    echo "Running: M=$M N=$N K=$K OVERSAMPLE=$OVERSAMPLE NGPUS=$NGPUS"
-    ./randomized_svd_multigpu_v2 \
-        --m "$M" \
-        --n "$N" \
-        --k "$K" \
-        --oversample "$OVERSAMPLE" \
-        --ngpus "$NGPUS"
-    echo "-------------------------------------"
+    for compress_config in "${COMPRESS_CONFIGS[@]}"
+    do
+        read -r MODE BITS QJL_DIM QJL_ALPHA <<< "$compress_config"
+        echo "Running: M=$M N=$N K=$K OVERSAMPLE=$OVERSAMPLE NGPUS=$NGPUS COMPRESS_B_MODE=$MODE COMPRESS_B_BITS=$BITS QJL_DIM=$QJL_DIM QJL_ALPHA=$QJL_ALPHA"
+        ./randomized_svd_multigpu_v2 \
+            --m "$M" \
+            --n "$N" \
+            --k "$K" \
+            --oversample "$OVERSAMPLE" \
+            --ngpus "$NGPUS" \
+            --compress-b-mode "$MODE" \
+            --compress-b-bits "$BITS" \
+            --qjl-dim "$QJL_DIM" \
+            --qjl-alpha "$QJL_ALPHA"
+        echo "-------------------------------------"
+    done
 done
 
 echo "Benchmark Complete!"
