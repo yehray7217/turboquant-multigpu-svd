@@ -4,6 +4,9 @@ test*.png
 test*.jpg
 test*.webp
 
+*.out
+*.err
+
 cusolver/cusolver
 cusolver/*_%j.out
 cusolver/*_%j.err
