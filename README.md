@@ -1,5 +1,41 @@
 # TurboQuant-QJL Accelerated Multi-GPU SVD
 
+## Table of Content
+
+- [TurboQuant-QJL Accelerated Multi-GPU SVD](#turboquant-qjl-accelerated-multi-gpu-svd)
+  - [Table of Content](#table-of-content)
+  - [專題題目](#專題題目)
+  - [專題概要](#專題概要)
+  - [研究動機](#研究動機)
+  - [平台環境](#平台環境)
+  - [Baseline 設計](#baseline-設計)
+    - [Baseline A：cuSOLVER SVD](#baseline-acusolver-svd)
+    - [Baseline B：自寫 Multi-GPU SVD / Randomized SVD](#baseline-b自寫-multi-gpu-svd--randomized-svd)
+  - [TurboQuant + QJL 方法概念](#turboquant--qjl-方法概念)
+    - [1. TurboQuant 的基本想法](#1-turboquant-的基本想法)
+    - [2. 為什麼需要 QJL Residual Correction？](#2-為什麼需要-qjl-residual-correction)
+    - [3. 本專題採用的壓縮策略](#3-本專題採用的壓縮策略)
+  - [Multi-GPU SVD 計算流程](#multi-gpu-svd-計算流程)
+    - [優化前：未壓縮通訊的 Multi-GPU SVD](#優化前未壓縮通訊的-multi-gpu-svd)
+      - [數學流程](#數學流程)
+      - [優化前資料流](#優化前資料流)
+    - [優化後：加入 TurboQuant + QJL 的 Multi-GPU SVD](#優化後加入-turboquant--qjl-的-multi-gpu-svd)
+      - [優化後資料流](#優化後資料流)
+  - [加速前後比較](#加速前後比較)
+  - [預計實驗指標](#預計實驗指標)
+    - [1. 效能指標](#1-效能指標)
+    - [2. 壓縮指標](#2-壓縮指標)
+    - [3. 數值精度指標](#3-數值精度指標)
+  - [預計實驗變因](#預計實驗變因)
+    - [GPU 數量](#gpu-數量)
+    - [矩陣規模](#矩陣規模)
+    - [目標 rank](#目標-rank)
+    - [傳輸格式](#傳輸格式)
+  - [Workflow Tree](#workflow-tree)
+  - [Repo 初步架構](#repo-初步架構)
+  - [預期成果](#預期成果)
+  - [未來可能應用](#未來可能應用)
+
 ## 專題題目
 
 **以 TurboQuant 與 QJL Residual Correction 降低多 GPU SVD 中間資料傳輸成本**
@@ -10,7 +46,7 @@
 
 Singular Value Decomposition（SVD）是科學計算、資料壓縮、主成分分析（PCA）與低秩矩陣近似中的核心運算。然而，當矩陣規模增大時，SVD 的計算成本、記憶體需求與資料搬移成本都會快速上升，因此常需要透過 GPU 與多 GPU 平行化來提升效能。
 
-在多 GPU 情境下，除了矩陣運算本身的計算成本外，**GPU 之間的資料交換與同步**也可能成為主要瓶頸。尤其是在矩陣分塊處理、低秩投影、正交化與中間結果彙整的過程中，若需要頻繁傳遞高維向量或中間矩陣，通訊成本可能限制整體加速效果。
+在多 GPU 情境下，除了矩陣運算本身的計算成本外，**GPU 之間的資料交換與同步**也可能成為主要瓶頸。尤其是在矩陣分塊處理、低秩投影(low-rank projection)、正交化與中間結果彙整的過程中，若需要頻繁傳遞高維向量或中間矩陣，通訊成本可能限制整體加速效果。
 
 本專題嘗試將 **TurboQuant** 的核心概念引入多 GPU SVD 計算流程，針對需要跨 GPU 傳輸的中間資料，使用：
 
@@ -23,7 +59,7 @@ Singular Value Decomposition（SVD）是科學計算、資料壓縮、主成分�
 - 是否能降低多 GPU 間的資料傳輸量；
 - 是否能減少 communication time；
 - 是否能改善端到端 SVD runtime；
-- 加入 QJL residual correction 後，是否能在壓縮下維持較佳的內積結構與數值精度。
+- 加入 QJL residual correction 後，是否能在壓縮下維持較佳的內積結構（矩陣能夠保持空間的距離與角度（具備么正性, unitary））與數值精度。
 
 ---
 
@@ -31,7 +67,7 @@ Singular Value Decomposition（SVD）是科學計算、資料壓縮、主成分�
 
 傳統 GPU SVD 優化大多聚焦於：
 
-- 提升矩陣乘法與分解 kernel 的吞吐量；
+- 提升矩陣乘法與分解的 kernel 吞吐量；
 - 使用高效 CUDA library；
 - 改善 block size、memory access pattern 與 GPU occupancy。
 
@@ -39,8 +75,8 @@ Singular Value Decomposition（SVD）是科學計算、資料壓縮、主成分�
 
 - GPU-GPU 資料交換；
 - NCCL collective communication；
-- 中間矩陣彙整；
-- QR / projection 階段的跨裝置同步。
+- 中間矩陣彙整(Aggregation)；
+- QR / projection 階段的跨裝置(cross-device)同步。
 
 因此，本專題從 **data movement bottleneck** 切入，探討：
 
@@ -72,7 +108,6 @@ Singular Value Decomposition（SVD）是科學計算、資料壓縮、主成分�
 
 - correctness verification；
 - 單 GPU library-level 效能基準；
-- 與自寫版本的數值結果互相比對。
 
 ### Baseline B：自寫 Multi-GPU SVD / Randomized SVD
 
@@ -83,21 +118,21 @@ Singular Value Decomposition（SVD）是科學計算、資料壓縮、主成分�
 - 通訊前後資料格式；
 - TurboQuant 與 QJL 的插入位置；
 
-本專題將另外實作一個 **自寫 multi-GPU SVD pipeline**，作為比較「優化前」與「優化後」的主要對象。
+而難以從 ScaLAPACK/Slate 中找到該部分並插入我們的實作。本專題將另外實作一個 **自寫 multi-GPU SVD pipeline**，作為比較「優化前」與「優化後」的主要對象。
 
-> 實作上，可優先考慮 **Randomized SVD**，因為其流程天然包含多 GPU 局部運算、投影矩陣整合與低秩重建，較適合觀察壓縮通訊對整體流程的影響。
+> 實作上，可優先考慮 **Randomized SVD**，因為其流程天然包含多 GPU 局部運算、投影矩陣整合與低秩重建(low-rank decompression)，較適合觀察壓縮通訊對整體流程的影響。
 
 ---
 
-# TurboQuant + QJL 方法概念
+## TurboQuant + QJL 方法概念
 
-## 1. TurboQuant 的基本想法
+### 1. TurboQuant 的基本想法
 
-TurboQuant 是一種針對高維向量設計的 online vector quantization 方法。其主要精神是：
+TurboQuant 是一種針對高維向量設計的 online(on-the-fly) vector quantization 方法。其主要精神是：
 
 1. 先對高維向量做隨機旋轉，使各座標的數值分布更集中；
-2. 再對旋轉後的座標分別做低位元 scalar quantization；
-3. 壓縮成低 bit representation；
+2. 再對旋轉後的座標分別做 low-bit scalar quantization；
+3. 壓縮成 low-bit representation；
 4. 解碼時重建近似向量。
 
 其核心流程如下：
@@ -120,9 +155,9 @@ Input Vector x
 
 ---
 
-## 2. 為什麼需要 QJL Residual Correction？
+### 2. 為什麼需要 QJL Residual Correction？
 
-若只使用 MSE-oriented quantization，雖然可以讓重建誤差下降，但對於後續涉及：
+若只使用 MSE-oriented quantization (MSE: Mean Squared Error)，雖然可以讓重建誤差下降，但對於後續涉及：
 
 - 內積；
 - 投影；
@@ -155,7 +190,7 @@ q = \mathrm{sign}(Gr)
 
 其中：
 
-- $G$ 為隨機投影矩陣；
+- $G$ 為隨機投影矩陣(random projection matrix)；
 - $\mathrm{sign}(\cdot)$ 將結果壓成 1-bit sign code；
 - $q$ 為 residual 的 QJL correction code。
 
@@ -173,7 +208,7 @@ Compressed Payload
 
 ---
 
-## 3. 本專題採用的壓縮策略
+### 3. 本專題採用的壓縮策略
 
 在本專題中，我們將採用：
 
@@ -210,13 +245,13 @@ Intermediate Vector / Block x
 
 ---
 
-# Multi-GPU SVD 計算流程
+## Multi-GPU SVD 計算流程
 
-## 優化前：未壓縮通訊的 Multi-GPU SVD
+### 優化前：未壓縮通訊的 Multi-GPU SVD
 
 以 randomized SVD 為例，基本流程如下。
 
-### 數學流程
+#### 數學流程
 
 給定輸入矩陣：
 
@@ -233,28 +268,35 @@ A \approx U_k \Sigma_k V_k^T
 其中流程可包含：
 
 1. 產生隨機投影矩陣：
+
    ```math
    \Omega \in \mathbb{R}^{n \times (k+p)}
    ```
 
 2. 各 GPU 計算局部投影：
+
    ```math
    Y_i = A_i \Omega
    ```
 
 3. 彙整或交換中間矩陣 $Y_i$，形成投影空間資訊；
 
-4. 進行 QR 分解：
+4. 進行 QR decomposition：
+
    ```math
    Y = QR
    ```
 
 5. 計算低維矩陣：
+
    ```math
    B = Q^T A
    ```
 
+   where B is reduced matrix.
+
 6. 對 $B$ 做 SVD：
+
    ```math
    B = \tilde{U} \Sigma V^T
    ```
@@ -264,12 +306,12 @@ A \approx U_k \Sigma_k V_k^T
    U = Q\tilde{U}
    ```
 
-### 優化前資料流
+#### 優化前資料流
 
 ```text
 Input Matrix A
 │
-├── Partition A across multiple GPUs
+├── Partitioning A across multiple GPUs
 │
 ├── Local randomized projection
 │   └── Y_i = A_i Ω
@@ -288,13 +330,13 @@ Input Matrix A
 
 ---
 
-## 優化後：加入 TurboQuant + QJL 的 Multi-GPU SVD
+### 優化後：加入 TurboQuant + QJL 的 Multi-GPU SVD
 
 本專題將 TurboQuant + QJL 插入於：
 
 > **中間矩陣產生之後、跨 GPU 傳輸之前。**
 
-### 優化後資料流
+#### 優化後資料流
 
 ```text
 Input Matrix A
@@ -316,7 +358,7 @@ Input Matrix A
 │   ├── Random projection of residual
 │   └── 1-bit sign encoding
 │
-├── Compressed Communication
+├── Communication (After Compression)
 │   ├── Send main quantized codes
 │   └── Send QJL residual codes
 │
@@ -336,23 +378,23 @@ Input Matrix A
 
 ---
 
-# 加速前後比較
+## 加速前後比較
 
-| 面向 | 原始 Multi-GPU SVD | TurboQuant + QJL Multi-GPU SVD |
-|---|---|---|
-| 中間資料傳輸 | FP32 / FP64 | 低位元主量化碼 + 1-bit QJL residual code |
-| 傳輸量 | 較大 | 預期下降 |
-| 額外計算 | 無 | rotation、quantization、residual、QJL encoding、decode |
-| 內積結構維持 | 取決於原始精度 | QJL 用於減少量化對 inner product 的偏差 |
-| 整體目標 | 標準多 GPU SVD | 通訊壓縮下的效能 / 精度 trade-off |
+| 面向         | 原始 Multi-GPU SVD | TurboQuant + QJL Multi-GPU SVD                         |
+| ------------ | ------------------ | ------------------------------------------------------ |
+| 中間資料傳輸 | FP32 / FP64        | 低位元主量化碼 + 1-bit QJL residual code               |
+| 傳輸量       | 較大               | 預期下降                                               |
+| 額外計算     | 無                 | rotation、quantization、residual、QJL encoding、decode |
+| 內積結構維持 | 取決於原始精度     | 精度預期下降；QJL 用於減少量化對 inner product 的偏差  |
+| 整體目標     | 標準 Multi-GPU SVD | 通訊壓縮下，效能 / 精度的 trade-off                    |
 
 ---
 
-# 預計實驗指標
+## 預計實驗指標
 
-## 1. 效能指標
+### 1. 效能指標
 
-- End-to-end runtime
+- End-to-end runtime(Elapsed real time / Wall time)
 - Communication time
 - Quantization time
 - QJL residual encoding time
@@ -364,55 +406,67 @@ Input Matrix A
   - 4 GPUs
   - 8 GPUs
 
-## 2. 壓縮指標
+### 2. 壓縮指標
 
 - 傳輸 byte 數
 - 壓縮前後 payload 大小
-- Main quantization bits per value
+- Main quantization bits per value(original scalar)
 - QJL residual bits per vector / block
-- Effective bit-rate
+- Effective bits per value
 
-## 3. 數值指標
+### 3. 數值精度指標
 
 - Reconstruction error：
+
   ```math
   \frac{\lVert A - U_k\Sigma_kV_k^T \rVert_F}{\lVert A \rVert_F}
   ```
 
+  where
+
+  ```math
+  \lVert ‧ \rVert_F
+  ```
+
+  is Frobenius norm of a matrix.
+
 - Singular value relative error：
+
   ```math
   \frac{\lVert \sigma - \hat{\sigma} \rVert_2}{\lVert \sigma \rVert_2}
   ```
 
+  where σ(sigma) is the vector of singular values.
+
 - Reduced matrix $B$ approximation error
 - Projection quality
-- 若實作允許，可額外比較 inner-product distortion
+- （若實作允許，可額外比較）Inner-product distortion
 
 ---
 
-# 預計實驗變因
+## 預計實驗變因
 
-## GPU 數量
+### GPU 數量
 
 - 1 GPU
 - 2 GPUs
 - 4 GPUs
 - 8 GPUs
 
-## 矩陣規模
+### 矩陣規模
 
 - Small
 - Medium
 - Large
 
-## 目標 rank
+### 目標 rank
 
 - $k = 32$
 - $k = 64$
 - $k = 128$
 - $k = 256$
 
-## 傳輸格式
+### 傳輸格式
 
 - FP32 communication
 - FP16 communication
@@ -421,7 +475,7 @@ Input Matrix A
 
 ---
 
-# Workflow Tree
+## Workflow Tree
 
 ```text
 Project Workflow
@@ -437,7 +491,7 @@ Project Workflow
 ├── 2. Baseline Construction
 │   ├── cuSOLVER SVD baseline
 │   │   ├── Correctness verification
-│   │   └── Reference runtime measurement
+│   │   └── Reference(baseline) runtime measurement
 │   │
 │   └── Custom multi-GPU SVD baseline
 │       ├── Matrix partitioning
@@ -490,7 +544,7 @@ Project Workflow
 
 ---
 
-# Repo 初步架構
+## Repo 初步架構
 
 ```text
 turboquant-qjl-multigpu-svd/
@@ -538,26 +592,28 @@ turboquant-qjl-multigpu-svd/
 
 ---
 
-# 預期成果
+## 預期成果
 
 本專題預期產出：
 
 1. 可在台灣杉二號執行的 GPU SVD baseline；
 2. 可觀察多 GPU 通訊成本的自寫 SVD / randomized SVD pipeline；
 3. 加入 TurboQuant main quantization 的壓縮傳輸版本；
-4. 加入 QJL residual correction 的完整壓縮傳輸版本；
+4. 承 3, 再加入 QJL residual correction 的完整壓縮傳輸版本；
 5. 優化前後在：
    - runtime；
    - communication time；
    - 傳輸量；
    - reconstruction error；
    - singular value error；
-   之間的系統性比較；
-6. 對「TurboQuant + QJL 是否適合用於分散式線性代數中間資料傳輸」給出初步結論。
+
+   <br>之間的系統性比較；
+
+6. 對「TurboQuant + QJL 是否適合用於 分散式線性代數 中間資料傳輸」給出初步結論。
 
 ---
 
-# 可能應用
+## 未來可能應用
 
 此方法未來可能延伸至：
 
