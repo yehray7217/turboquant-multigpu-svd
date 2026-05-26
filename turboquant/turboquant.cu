@@ -497,19 +497,37 @@ __global__ void column_tq_forward_fwht_kernel(
     transformed[static_cast<std::size_t>(col) * padded_rows + row] = smem[row] * inv_sqrt_n;
 }
 
-__global__ void column_tq_inverse_fwht_add_kernel(
-    const float* transformed,
+__global__ void column_tq_dequant_inverse_fwht_add_kernel(
+    const std::uint8_t* codes,
     float* values,
     int rows,
     int cols,
     int padded_rows,
+    int bits,
+    float scale,
     unsigned seed) {
     extern __shared__ float smem[];
     const int col = blockIdx.x;
     const int row = threadIdx.x;
     if (col >= cols || row >= padded_rows) return;
 
-    smem[row] = transformed[static_cast<std::size_t>(col) * padded_rows + row];
+    const std::size_t idx = static_cast<std::size_t>(col) * padded_rows + row;
+    int q = 0;
+    if (bits == 8) {
+        q = static_cast<int>(static_cast<std::int8_t>(codes[idx]));
+    } else if (bits == 4) {
+        const std::uint8_t byte = codes[idx / 2];
+        const std::uint8_t code = ((idx & 1) == 0) ?
+            static_cast<std::uint8_t>(byte & 0x0f) :
+            static_cast<std::uint8_t>((byte >> 4) & 0x0f);
+        q = static_cast<int>(code) - 8;
+    } else {
+        const std::uint8_t byte = codes[idx / 4];
+        const std::uint8_t code =
+            static_cast<std::uint8_t>((byte >> ((idx & 3) * 2)) & 0x03);
+        q = static_cast<int>(code) - 1;
+    }
+    smem[row] = static_cast<float>(q) * scale;
     __syncthreads();
 
     for (int len = 1; len < padded_rows; len <<= 1) {
@@ -1503,7 +1521,9 @@ DeviceCompressedBlock quantize_fp32_device_column_tq_to_device_payload(
         check_cuda(cudaGetLastError(), "launch column tq-qjl pack signs kernel");
     }
 
-    check_cuda(cudaStreamSynchronize(stream), "cudaStreamSynchronize column TQ quantization");
+    if (options.mode == QuantizeMode::kTurboQuantQjl || !d_external_work) {
+        check_cuda(cudaStreamSynchronize(stream), "cudaStreamSynchronize column TQ quantization");
+    }
 
     if (d_qjl_partials) cudaFree(d_qjl_partials);
     if (d_residual) cudaFree(d_residual);
@@ -1668,36 +1688,49 @@ void dequantize_column_tq_payload_add_to_fp32(
     const std::size_t work_count = static_cast<std::size_t>(block.padded_count);
     const int threads = 256;
 
-    if (block.bits == 8) {
-        const int blocks = static_cast<int>((work_count + threads - 1) / threads);
-        dequantize_int8_kernel<<<blocks, threads, 0, stream>>>(block.d_codes, d_work, work_count, block.scale);
-    } else if (block.bits == 4) {
-        const int blocks = static_cast<int>((work_count + threads - 1) / threads);
-        dequantize_int4_pack_kernel<<<blocks, threads, 0, stream>>>(block.d_codes, d_work, work_count, block.scale);
-    } else if (block.bits == 2) {
-        const int blocks = static_cast<int>((work_count + threads - 1) / threads);
-        dequantize_int2_pack_kernel<<<blocks, threads, 0, stream>>>(block.d_codes, d_work, work_count, block.scale);
-    } else {
-        throw std::runtime_error("Unsupported column TQ payload bit width.");
-    }
-    check_cuda(cudaGetLastError(), "launch column TQ payload dequantization kernel");
-
     if (!d_signs && padded_rows <= 1024) {
-        column_tq_inverse_fwht_add_kernel<<<block.cols, padded_rows, padded_rows * sizeof(float), stream>>>(
-            d_work, d_accumulator, block.rows, block.cols, padded_rows, block.seed);
-        check_cuda(cudaGetLastError(), "launch shared column TQ inverse FWHT add kernel");
-    } else if (d_signs) {
-        fwht_columns_normalized_device(d_work, padded_rows, block.cols, stream);
-        const int blocks = static_cast<int>((block.value_count() + threads - 1) / threads);
-        apply_sign_mask_truncate_columns_add_kernel<<<blocks, threads, 0, stream>>>(
-            d_work, d_signs, d_accumulator, block.rows, block.cols, padded_rows);
-        check_cuda(cudaGetLastError(), "launch column TQ inverse sign-mask/truncate add kernel");
+        if (block.bits != 8 && block.bits != 4 && block.bits != 2) {
+            throw std::runtime_error("Unsupported column TQ payload bit width.");
+        }
+        column_tq_dequant_inverse_fwht_add_kernel<<<
+            block.cols, padded_rows, padded_rows * sizeof(float), stream>>>(
+            block.d_codes,
+            d_accumulator,
+            block.rows,
+            block.cols,
+            padded_rows,
+            block.bits,
+            block.scale,
+            block.seed);
+        check_cuda(cudaGetLastError(), "launch fused column TQ dequant/inverse FWHT add kernel");
     } else {
-        fwht_columns_normalized_device(d_work, padded_rows, block.cols, stream);
-        const int blocks = static_cast<int>((block.value_count() + threads - 1) / threads);
-        apply_random_sign_truncate_columns_add_kernel<<<blocks, threads, 0, stream>>>(
-            d_work, d_accumulator, block.rows, block.cols, padded_rows, block.seed);
-        check_cuda(cudaGetLastError(), "launch column TQ inverse random-sign/truncate add kernel");
+        if (block.bits == 8) {
+            const int blocks = static_cast<int>((work_count + threads - 1) / threads);
+            dequantize_int8_kernel<<<blocks, threads, 0, stream>>>(block.d_codes, d_work, work_count, block.scale);
+        } else if (block.bits == 4) {
+            const int blocks = static_cast<int>((work_count + threads - 1) / threads);
+            dequantize_int4_pack_kernel<<<blocks, threads, 0, stream>>>(block.d_codes, d_work, work_count, block.scale);
+        } else if (block.bits == 2) {
+            const int blocks = static_cast<int>((work_count + threads - 1) / threads);
+            dequantize_int2_pack_kernel<<<blocks, threads, 0, stream>>>(block.d_codes, d_work, work_count, block.scale);
+        } else {
+            throw std::runtime_error("Unsupported column TQ payload bit width.");
+        }
+        check_cuda(cudaGetLastError(), "launch column TQ payload dequantization kernel");
+
+        if (d_signs) {
+            fwht_columns_normalized_device(d_work, padded_rows, block.cols, stream);
+            const int blocks = static_cast<int>((block.value_count() + threads - 1) / threads);
+            apply_sign_mask_truncate_columns_add_kernel<<<blocks, threads, 0, stream>>>(
+                d_work, d_signs, d_accumulator, block.rows, block.cols, padded_rows);
+            check_cuda(cudaGetLastError(), "launch column TQ inverse sign-mask/truncate add kernel");
+        } else {
+            fwht_columns_normalized_device(d_work, padded_rows, block.cols, stream);
+            const int blocks = static_cast<int>((block.value_count() + threads - 1) / threads);
+            apply_random_sign_truncate_columns_add_kernel<<<blocks, threads, 0, stream>>>(
+                d_work, d_accumulator, block.rows, block.cols, padded_rows, block.seed);
+            check_cuda(cudaGetLastError(), "launch column TQ inverse random-sign/truncate add kernel");
+        }
     }
     if (block.mode == QuantizeMode::kTurboQuantQjl &&
         block.qjl_dim > 0 &&
