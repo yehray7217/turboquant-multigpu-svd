@@ -121,6 +121,8 @@ struct Options {
     bool host_reduce_b = false;
     int repeat = 1;
     int repeat_print_every = 1;
+    std::string spectrum_decay_mode = "random";
+    float spectrum_decay_param = 0.5f;
 };
 
 static void print_usage(const char* prog) {
@@ -147,6 +149,10 @@ static void print_usage(const char* prog) {
         << "  --repeat <int>        Reuse setup and run the compute pipeline N times. Default: 1\n"
         << "  --repeat-print-every <int>\n"
         << "                        Print detailed timings every N repeats. 0 means first/last only. Default: 1\n"
+        << "  --spectrum-decay-mode <random|polynomial|exponential>\n"
+        << "                        Test matrix spectrum. Default: random\n"
+        << "  --spectrum-decay-param <float>\n"
+        << "                        p for polynomial, alpha for exponential. Default: 0.5\n"
         << "  --no-check-error      Skip fast reconstruction error.\n"
         << "  --no-check-b-error    Skip B_i compression error copy/check.\n";
 }
@@ -171,6 +177,8 @@ static Options parse_args(int argc, char** argv) {
         else if (a == "--qjl-alpha") opt.qjl_alpha = std::stof(need_value(a));
         else if (a == "--repeat") opt.repeat = std::stoi(need_value(a));
         else if (a == "--repeat-print-every") opt.repeat_print_every = std::stoi(need_value(a));
+        else if (a == "--spectrum-decay-mode") opt.spectrum_decay_mode = need_value(a);
+        else if (a == "--spectrum-decay-param") opt.spectrum_decay_param = std::stof(need_value(a));
         else if (a == "--allow-host-tq-prototype") opt.allow_host_tq_prototype = true;
         else if (a == "--device-random-input") opt.device_random_input = true;
         else if (a == "--skip-form-u") opt.skip_form_u = true;
@@ -195,6 +203,16 @@ static Options parse_args(int argc, char** argv) {
     }
     if (opt.k + opt.oversample > std::min(opt.m, opt.n)) {
         throw std::runtime_error("Require k + oversample <= min(m, n).");
+    }
+    if (opt.spectrum_decay_mode != "random" && opt.spectrum_decay_mode != "polynomial" &&
+        opt.spectrum_decay_mode != "exponential") {
+        throw std::runtime_error("spectrum-decay-mode must be one of: random, polynomial, exponential.");
+    }
+    if (opt.spectrum_decay_mode != "random" && opt.spectrum_decay_param <= 0.0f) {
+        throw std::runtime_error("spectrum-decay-param must be positive for polynomial/exponential input.");
+    }
+    if (opt.spectrum_decay_mode != "random" && opt.device_random_input) {
+        throw std::runtime_error("polynomial/exponential input is host-generated; omit --device-random-input.");
     }
     turboquant::QuantizeOptions qopt =
         turboquant::make_quantize_options(opt.compress_b_bits, opt.compress_b_mode, opt.qjl_dim, opt.qjl_alpha, opt.seed);
@@ -253,6 +271,71 @@ static std::vector<std::vector<float>> make_random_row_blocks(
             }
         }
     }
+    if (norm2_out) *norm2_out = static_cast<double>(norm2);
+    return blocks;
+}
+
+static float sine_basis_value(int length, int row, int basis_col) {
+    const double pi = std::acos(-1.0);
+    const double scale = std::sqrt(2.0 / static_cast<double>(length + 1));
+    const double angle = pi * static_cast<double>((row + 1) * (basis_col + 1)) /
+                         static_cast<double>(length + 1);
+    return static_cast<float>(scale * std::sin(angle));
+}
+
+static float spectrum_value(int idx, const std::string& decay_mode, float decay_param) {
+    if (decay_mode == "polynomial") {
+        return static_cast<float>(std::pow(static_cast<double>(idx + 1), -static_cast<double>(decay_param)));
+    }
+    if (decay_mode == "exponential") {
+        return static_cast<float>(std::exp(-static_cast<double>(decay_param) * idx));
+    }
+    throw std::runtime_error("spectrum_value called for non-spectrum input mode.");
+}
+
+static std::vector<std::vector<float>> make_spectrum_row_blocks(
+    const std::vector<int>& rows,
+    int m,
+    int n,
+    int rank,
+    const std::string& decay_mode,
+    float decay_param,
+    double* norm2_out) {
+    std::vector<std::vector<float>> blocks(rows.size());
+    for (size_t g = 0; g < rows.size(); ++g) {
+        blocks[g].resize(static_cast<size_t>(rows[g]) * n);
+    }
+
+    std::vector<float> sigma(rank);
+    for (int r = 0; r < rank; ++r) {
+        sigma[r] = spectrum_value(r, decay_mode, decay_param);
+    }
+
+    int global_row0 = 0;
+    long double norm2 = 0.0L;
+    for (size_t g = 0; g < rows.size(); ++g) {
+        for (int col = 0; col < n; ++col) {
+            const std::vector<float>::size_type col_offset = static_cast<size_t>(col) * rows[g];
+            std::vector<float> v_col(rank);
+            for (int r = 0; r < rank; ++r) {
+                v_col[r] = sine_basis_value(n, col, r);
+            }
+            for (int row = 0; row < rows[g]; ++row) {
+                const int global_row = global_row0 + row;
+                double value = 0.0;
+                for (int r = 0; r < rank; ++r) {
+                    value += static_cast<double>(sine_basis_value(m, global_row, r)) *
+                             static_cast<double>(sigma[r]) *
+                             static_cast<double>(v_col[r]);
+                }
+                float x = static_cast<float>(value);
+                blocks[g][col_offset + row] = x;
+                norm2 += static_cast<long double>(x) * x;
+            }
+        }
+        global_row0 += rows[g];
+    }
+
     if (norm2_out) *norm2_out = static_cast<double>(norm2);
     return blocks;
 }
@@ -413,6 +496,8 @@ int main(int argc, char** argv) {
                   << " compress_b_bits=" << opt.compress_b_bits
                   << " qjl_alpha=" << opt.qjl_alpha
                   << " device_random_input=" << (opt.device_random_input ? "yes" : "no")
+                  << " spectrum_decay_mode=" << opt.spectrum_decay_mode
+                  << " spectrum_decay_param=" << opt.spectrum_decay_param
                   << " skip_form_u=" << (opt.skip_form_u ? "yes" : "no")
                   << " host_reduce_b=" << (opt.host_reduce_b ? "yes" : "no")
                   << " repeat=" << opt.repeat
@@ -428,8 +513,15 @@ int main(int argc, char** argv) {
         {
             NvtxRange range("init_host_random");
             if (!opt.device_random_input) {
-                h_A_blocks = make_random_row_blocks(
-                    rows, n, opt.seed, 1.0f / std::sqrt(static_cast<float>(m)), &h_A_norm2);
+                if (opt.spectrum_decay_mode == "random") {
+                    h_A_blocks = make_random_row_blocks(
+                        rows, n, opt.seed, 1.0f / std::sqrt(static_cast<float>(m)), &h_A_norm2);
+                } else {
+                    const int spectrum_rank = std::min(2000, std::min(m, n));
+                    //const int spectrum_rank = std::min(m, n);
+                    h_A_blocks = make_spectrum_row_blocks(
+                        rows, m, n, spectrum_rank, opt.spectrum_decay_mode, opt.spectrum_decay_param, &h_A_norm2);
+                }
                 h_Omega = make_random_matrix(n, l, opt.seed + 1, 1.0f);
             }
         }
