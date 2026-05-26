@@ -1,5 +1,8 @@
 # TurboQuant-QJL Accelerated Multi-GPU SVD
 
+Project optimization history and benchmark decisions are tracked in
+[OPTIMIZATION_HISTORY.md](OPTIMIZATION_HISTORY.md).
+
 ## Table of Content
 
 - [TurboQuant-QJL Accelerated Multi-GPU SVD](#turboquant-qjl-accelerated-multi-gpu-svd)
