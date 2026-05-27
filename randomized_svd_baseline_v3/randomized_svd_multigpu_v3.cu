@@ -407,6 +407,10 @@ struct DeviceWork {
     std::uint8_t* d_Bi_codes = nullptr; // compressed B_i payload
     int* d_Bi_qjl_signs = nullptr;      // tq-qjl residual signs
     float* d_Bi_tq_work = nullptr;      // column-wise tq encode scratch
+    // Pre-allocated QJL scratch buffers to avoid per-call cudaMalloc in hot loop.
+    float* d_Bi_qjl_reconstructed = nullptr; // tq-qjl: l x n reconstructed scratch
+    float* d_Bi_qjl_residual = nullptr;      // tq-qjl: l x n residual scratch
+    float* d_Bi_qjl_partials = nullptr;      // tq-qjl: qjl_dim * 128 partial sums
     float* d_Uti_k = nullptr;    // l x k
     float* d_Ui = nullptr;       // mi x k
     int* d_info = nullptr;
@@ -427,6 +431,9 @@ static void destroy_work(DeviceWork& w) {
     if (w.d_Bi_codes) cudaFree(w.d_Bi_codes);
     if (w.d_Bi_qjl_signs) cudaFree(w.d_Bi_qjl_signs);
     if (w.d_Bi_tq_work) cudaFree(w.d_Bi_tq_work);
+    if (w.d_Bi_qjl_reconstructed) cudaFree(w.d_Bi_qjl_reconstructed);
+    if (w.d_Bi_qjl_residual) cudaFree(w.d_Bi_qjl_residual);
+    if (w.d_Bi_qjl_partials) cudaFree(w.d_Bi_qjl_partials);
     if (w.d_Uti_k) cudaFree(w.d_Uti_k);
     if (w.d_Ui) cudaFree(w.d_Ui);
     if (w.d_info) cudaFree(w.d_info);
@@ -612,6 +619,14 @@ int main(int argc, char** argv) {
                     }
                     if (compress_b_qjl) {
                         CHECK_CUDA(cudaMalloc(&w.d_Bi_qjl_signs, bi_qjl_sign_bytes));
+                        // Pre-allocate QJL scratch buffers to avoid per-call cudaMalloc.
+                        CHECK_CUDA(cudaMalloc(&w.d_Bi_qjl_reconstructed, bi_fp32_bytes));
+                        CHECK_CUDA(cudaMalloc(&w.d_Bi_qjl_residual, bi_fp32_bytes));
+                        const size_t qjl_partials_count =
+                            static_cast<size_t>(b_quant_options.qjl_dim) *
+                            turboquant::kQjlColumnBlocksPerSketch;
+                        CHECK_CUDA(cudaMalloc(&w.d_Bi_qjl_partials,
+                                              qjl_partials_count * sizeof(float)));
                     }
                 }
             }
@@ -929,7 +944,10 @@ int main(int argc, char** argv) {
                                 w.d_Bi_codes,
                                 w.d_Bi_tq_work,
                                 nullptr,
-                                w.d_Bi_qjl_signs);
+                                w.d_Bi_qjl_signs,
+                                w.d_Bi_qjl_reconstructed,
+                                w.d_Bi_qjl_residual,
+                                w.d_Bi_qjl_partials);
                         } else {
                             compressed = turboquant::quantize_fp32_device_block_to_device_payload(
                                 w.d_Bi,
