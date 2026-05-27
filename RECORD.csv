@@ -14,10 +14,18 @@ TQ+QJL 4-bit (Loop 3 re-run),1,8,32k x 8k,16.002 MiB,N/A,4.99937x,68.393 ms,skip
 none,2,16,32k x 8k,160 MiB,20 MiB,1.00x,66.3761 ms,skipped,0.00%
 TQ 4-bit,2,16,32k x 8k,32.0001 MiB,4.00002 MiB,5.00x,49.8578 ms,0.175305,24.90%
 TQ 2-bit,2,16,32k x 8k,16.0001 MiB,2.00002 MiB,10.00x,47.7098 ms,0.952533,28.10%
-TQ+QJL 4-bit,2,16,32k x 8k,32.0197 MiB,4.00246 MiB,5.00x,205.19 ms,0.263931,-209.10%
-TQ+QJL 2-bit,2,16,32k x 8k,16.0197 MiB,2.00246 MiB,9.99x,204.344 ms,1.434003,-207.90%
+TQ+QJL 4-bit (BEFORE alloc fix),2,16,32k x 8k,32.0197 MiB,4.00246 MiB,5.00x,205.19 ms,0.263931,-209.10%
+TQ+QJL 2-bit (BEFORE alloc fix),2,16,32k x 8k,16.0197 MiB,2.00246 MiB,9.99x,204.344 ms,1.434003,-207.90%
+none (Loop 4 A1 re-run),2,16,32k x 8k,160 MiB,20 MiB,1.00x,66.49 ms,skipped,0.00%
+TQ 4-bit (Loop 4 A1 re-run),2,16,32k x 8k,32.0001 MiB,4.00002 MiB,5.00x,49.09 ms,skipped,26.17%
+TQ+QJL 4-bit (AFTER alloc fix Loop 4),2,16,32k x 8k,32.004 MiB,4.0005 MiB,4.999x,82.69 ms,skipped,-24.36%
+FP16 (Loop 4 A2),2,16,32k x 8k,160 MiB,10 MiB,2.00x,63.49 ms,~0.0002,4.17%
 none,2,16,64k x 16k,320 MiB,40 MiB,1.00x,91.3809 ms,skipped,0.00%
 TQ 4-bit,2,16,64k x 16k,64.0001 MiB,8.00002 MiB,5.00x,71.1684 ms,0.1802,22.10%
 TQ 2-bit,2,16,64k x 16k,32.0001 MiB,4.00002 MiB,10.00x,64.7848 ms,0.960169,29.10%
-TQ+QJL 4-bit,2,16,64k x 16k,64.0197 MiB,8.00246 MiB,5.00x,379.724 ms,0.339721,-315.50%
-TQ+QJL 2-bit,2,16,64k x 16k,32.0197 MiB,4.00246 MiB,9.99x,370.227 ms,1.809998,-305.10%
+TQ+QJL 4-bit (BEFORE alloc fix),2,16,64k x 16k,64.0197 MiB,8.00246 MiB,5.00x,379.724 ms,0.339721,-315.50%
+TQ+QJL 2-bit (BEFORE alloc fix),2,16,64k x 16k,32.0197 MiB,4.00246 MiB,9.99x,370.227 ms,1.809998,-305.10%
+none (Loop 4 A1 re-run),2,16,64k x 16k,320 MiB,40 MiB,1.00x,89.72 ms,skipped,0.00%
+TQ 4-bit (Loop 4 A1 re-run),2,16,64k x 16k,64.0001 MiB,8.00002 MiB,5.00x,71.52 ms,skipped,20.28%
+TQ+QJL 4-bit (AFTER alloc fix Loop 4),2,16,64k x 16k,64.004 MiB,8.0005 MiB,4.9997x,133.56 ms,skipped,-48.86%
+FP16 (Loop 4 A2),2,16,64k x 16k,320 MiB,20 MiB,2.00x,90.24 ms,~0.0002,-0.57%

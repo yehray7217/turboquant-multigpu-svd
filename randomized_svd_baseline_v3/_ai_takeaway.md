@@ -7,8 +7,8 @@ It is the primary location for claiming cross-node speedup from compressed
 MPI collectives.
 
 Key addition over v2: the cross-node `B` reduction uses **compressed gather/decode**
-(not FP32 MPI_Reduce) when `--compress-b-mode tq/lowbit/tq-qjl` is set.
-This is where the ~19–22% speedup claim comes from.
+(not FP32 MPI_Reduce) when `--compress-b-mode tq/lowbit/tq-qjl/fp16` is set.
+This is where the ~20% speedup claim comes from.
 
 Current limit: **16 GPUs** (2 nodes × 8 GPUs) due to Taiwania 2 QoS policy.
 
@@ -18,13 +18,15 @@ Current limit: **16 GPUs** (2 nodes × 8 GPUs) due to Taiwania 2 QoS policy.
 
 | File | Description |
 |------|-------------|
-| `randomized_svd_multigpu_v3.cu` | Main source. MPI + CUDA. One rank per node, all local GPUs per rank. |
+| `randomized_svd_multigpu_v3.cu` | Main source. MPI + CUDA. One rank per node, all local GPUs per rank. Includes `fp16` mode (Loop 4). |
 | `Makefile` | Requires MPI modules. `module load ucx/1.14.1 openmpi/5.0.2_ucx1.14.1_cuda12.3`. |
 | `README.md` | Current results, communication model, build/run instructions. |
 | `run_randomized_svd_multigpu_v3_tq_bit_curve_16gpu.slurm` | Main 16-GPU sweep (m=32768). |
 | `run_randomized_svd_multigpu_v3_tq_bit_curve_16gpu_large.slurm` | Large 16-GPU sweep (m=65536). |
 | `run_randomized_svd_multigpu_v3_smoke_16gpu.slurm` | Quick smoke test: one mode, few repeats. |
 | `run_multinode_gpu_visibility_probe_32gpu.slurm` | 32-GPU probe (pending QoS approval). |
+| `run_v3_qjl_postfix_verify.slurm` | Loop 4 A1: QJL pre-alloc fix verification on 16-GPU (job 931560). |
+| `run_v3_fp16_baseline.slurm` | Loop 4 A2: FP16 MPI gather baseline — none/fp16/TQ-4bit/TQ-2bit at two matrix sizes (job 931564). |
 
 ---
 
@@ -83,6 +85,7 @@ number: the compressed payload actually crossing the network.
 |---------------------|-----------------|---------|
 | `none` | `fp32_reduce` (MPI_Reduce FP32) | Full FP32 B crosses network |
 | `tq` / `lowbit` / `tq-qjl` | `compressed_gather_decode` | Only compressed payload crosses |
+| `fp16` | `fp16_gather_decode` | Half-precision payload crosses (2×); near-lossless |
 
 ---
 
@@ -106,25 +109,35 @@ sbatch run_randomized_svd_multigpu_v3_smoke_16gpu.slurm
 
 ## Current Headline Results
 
-### Base run (m=32768, n=8192, k=256, 16 GPUs, repeat=5)
+### Loop 4 definitive runs (m=32768, n=8192, k=256, 16 GPUs, repeat=100, jobs 931560+931564)
 
-| Mode | Warm Pipeline | Node-local B | MPI B | B Error |
-|------|--------------|-------------|-------|---------|
-| none | 64.56 ms | 160 MiB | 20 MiB | — |
-| TQ 4-bit | 50.09 ms (**−22.4%**) | 32 MiB | 4 MiB | 0.175 |
-| TQ 2-bit | 47.17 ms (**−26.9%**) | 16 MiB | 2 MiB | 0.953 |
+| Mode | Warm Pipeline | MPI B | B Error | vs none |
+|------|--------------|-------|---------|---------|
+| none | 66.49 ms | 20 MiB | — | — |
+| **FP16** | **63.49 ms** | **10 MiB** | **~0.0002** | **−4.5%** |
+| **TQ 4-bit** | **49.09 ms** | **4 MiB** | **0.175** | **−26.2%** |
+| TQ 2-bit | 46.95 ms | 2 MiB | 0.953 | −29.4% |
+| TQ+QJL 4-bit (post-fix) | 82.69 ms | 4 MiB | — | −24.4%† |
 
-### Large run (m=65536, n=16384, k=256, 16 GPUs, repeat=20) — after all optimizations
+†QJL still slower than `none` even post-fix; confirmed dead end.
 
-| Mode | Warm Pipeline | Node-local B | MPI B | B Error |
-|------|--------------|-------------|-------|---------|
-| none | 90.22 ms | 320 MiB | 40 MiB | — |
-| TQ 4-bit | 71.49 ms (**−20.8%**) | 64 MiB | 8 MiB | 0.180 |
-| TQ 2-bit | 64.82 ms (**−28.1%**) | 32 MiB | 4 MiB | 0.960 |
+### Loop 4 definitive runs (m=65536, n=16384, k=256, 16 GPUs, repeat=100, jobs 931560+931564)
 
-These numbers include both optimizations applied:
-1. Removed tail synchronization from TQ-only path: −1.07 ms (TQ 4-bit)
-2. Fused decode-add kernel: −0.68 ms (TQ 4-bit), −1.47 ms (TQ 2-bit)
+| Mode | Warm Pipeline | MPI B | B Error | vs none |
+|------|--------------|-------|---------|---------|
+| none | 89.72 ms | 40 MiB | — | — |
+| **FP16** | **90.24 ms** | **20 MiB** | **~0.0002** | **~0%** |
+| **TQ 4-bit** | **71.52 ms** | **8 MiB** | **0.180** | **−20.3%** |
+| TQ 2-bit | 64.20 ms | 4 MiB | 0.960 | −28.5% |
+| TQ+QJL 4-bit (post-fix) | 133.56 ms | 8 MiB | — | −48.9%† |
+
+†TQ+QJL post-fix: was 379 ms pre-fix, now 133 ms — alloc fix confirmed (−65%).
+
+**FP16 insight**: near-lossless, but 2× MPI compression insufficient vs TQ 4-bit's 5× at
+multi-node scale. FP16 pipeline is dominated by the sequential H2D→decode loop on root;
+at 64k×16k this fully negates the halved MPI bytes. TQ 4-bit wins decisively.
+
+These numbers include all optimizations (tail sync removal, fused decode-add).
 
 ---
 
@@ -142,7 +155,7 @@ Current maximum: **2 nodes = 16 GPUs** under `nycugpu_queue / contest_v100` QoS.
 ## Next Steps / What To Try
 
 1. **Report large run (m=65536) as headline** — bigger matrix means larger absolute
-   MPI B payload (40 MiB) so compression has more impact.
+   MPI B payload (40 MiB) so compression has more impact. ✓ Done in Loop 4.
 2. **If QoS opens 4+ nodes**: re-run the 32-GPU probe and see how speedup scales.
 3. **TQ 8-bit**: currently swept in v2 but not prominently in v3. Adds a data point
    to the compression-vs-accuracy curve (between none and TQ 4-bit).
@@ -154,3 +167,7 @@ Current maximum: **2 nodes = 16 GPUs** under `nycugpu_queue / contest_v100` QoS.
    latency at large rank counts.
 6. **Smoke test before each major job**: always run the smoke script first to
    confirm the binary and MPI setup work correctly before submitting long sweeps.
+7. **FP16 optimization (if desired)**: replace the sequential per-rank H2D→decode
+   loop with a batch H2D copy of all ranks' data followed by a fused fp16→fp32→add
+   kernel. This could recover the FP16 advantage at 64k×16k — but given TQ 4-bit's
+   dominance this is low priority.

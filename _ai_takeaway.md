@@ -86,6 +86,7 @@ turboquant-multigpu-svd/
   - **MPI** multi-node extension of v2.
   - Cross-node $B$ reduction uses compressed gather/decode instead of FP32 MPI_Reduce.
   - Tested up to 16 GPUs (2 nodes × 8 GPUs, Slurm QoS limit).
+  - Loop 4 adds the QJL pre-alloc fix verification and an FP16 MPI baseline on 16 GPUs.
 
 - **SLATE naive baseline**:
   - Unoptimized SLATE R(randomized)SVD with `Lookahead=0`, `nb=256`.
@@ -99,7 +100,7 @@ turboquant-multigpu-svd/
 | `lowbit` | Per-block symmetric scalar quantization (8/4/2-bit)               |
 | `tq`     | Random Rademacher signs + FWHT rotation + low-bit quant + inverse |
 | `tq-qjl` | TQ + QJL residual 1-bit sign sketch correction (exploratory)      |
-| `fp16`   | Pure FP16 cast on B_i before P2P (2× compression, ~0.0002 rel-err) — v2 only |
+| `fp16`   | Pure FP16 cast on B_i before P2P (2× compression, ~0.0002 rel-err); used as a Loop 4 baseline |
 
 ### Key Optimizations Applied
 
@@ -119,17 +120,23 @@ turboquant-multigpu-svd/
 
 ### Current Best Results
 
-**v3 TQ 4-bit on 16 GPUs (m=65536, n=16384, k=256):**
+**Loop 4 v3 headline run on 16 GPUs (m=65536, n=16384, k=256):**
 
-- MPI B payload: 40 MiB → 8 MiB (4.99999× compression)
-- Pipeline: 90.22 ms (none) → 71.49 ms (TQ 4-bit) — **~21% speedup**
-- B relative error: 0.180
+- none: 89.72 ms, 40 MiB MPI B
+- FP16: 90.24 ms, 20 MiB MPI B, ~0.0002 B error, ~0% vs none
+- TQ 4-bit: 71.52 ms, 8 MiB MPI B, 0.180 B error, **−20.3%** vs none
+- TQ 2-bit: 64.20 ms, 4 MiB MPI B, 0.960 B error, **−28.5%** vs none
+- TQ+QJL 4-bit (post-fix): 133.56 ms, 8 MiB MPI B; alloc fix confirmed, but still slower than none
 
-**v3 TQ 2-bit on 16 GPUs (aggressive):**
+**Loop 4 cross-check on the smaller 16-GPU run (m=32768, n=8192, k=256):**
 
-- MPI B payload: 40 MiB → 4 MiB (~10× compression)
-- Pipeline: 90.22 ms → 64.82 ms — **~28% speedup**
-- B relative error: 0.960 (too high for accurate SVD, use as compression bound)
+- none: 66.49 ms
+- FP16: 63.49 ms
+- TQ 4-bit: 49.09 ms
+- TQ 2-bit: 46.95 ms
+- TQ+QJL 4-bit (post-fix): 82.69 ms
+
+FP16 is near-lossless, but the 2× payload reduction is not enough to beat TQ 4-bit at the larger multi-node scale. QJL remains a confirmed dead end even after the pre-alloc fix.
 
 **v2 TQ 4-bit on 2 GPUs (single-node reference):**
 
