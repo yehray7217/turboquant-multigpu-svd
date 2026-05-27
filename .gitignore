@@ -1,6 +1,10 @@
 .DS_Store
 .vscode/*
 
+# slurm output
+*.out
+*.err
+
 test*.png
 test*.jpg
 test*.webp
