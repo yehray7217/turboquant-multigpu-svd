@@ -14,7 +14,7 @@ set -euo pipefail
 
 module load cuda/12.8
 
-PROJECT_ROOT=/home/yehray7217/turboquant-multigpu-svd/randomized_svd_baseline_v3
+PROJECT_ROOT=$HOME/turboquant-multigpu-svd/randomized_svd_baseline_v3
 cd "$PROJECT_ROOT"
 
 echo "Starting multi-node GPU visibility probe, requested 32 GPUs"

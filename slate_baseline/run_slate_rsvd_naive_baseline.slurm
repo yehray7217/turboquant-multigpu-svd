@@ -10,7 +10,7 @@
 
 set -eo pipefail
 
-cd /home/rax10101010/hpc_final/turboquant-multigpu-svd/slate_baseline
+cd $HOME/hpc_final/turboquant-multigpu-svd/slate_baseline
 
 # Load CUDA/MPI toolchain and local SLATE path (if already installed).
 source ./env_taiwania2.sh

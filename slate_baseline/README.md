@@ -24,7 +24,7 @@ This baseline is intentionally configured as an **unoptimized naive baseline** t
 ## Quick Start (for your current errors)
 
 ```bash
-cd /home/rax10101010/hpc_final/turboquant-multigpu-svd/slate_baseline
+cd $HOME/hpc_final/turboquant-multigpu-svd/slate_baseline
 source ./env_taiwania2.sh
 make doctor
 ```
@@ -59,7 +59,7 @@ Current default in this repository:
 ## Background Setup (SSH disconnect safe)
 
 ```bash
-cd /home/rax10101010/hpc_final/turboquant-multigpu-svd/slate_baseline
+cd $HOME/hpc_final/turboquant-multigpu-svd/slate_baseline
 ./start_background_setup.sh
 ./check_background_setup.sh
 ```

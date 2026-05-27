@@ -11,7 +11,7 @@
 
 set -eo pipefail
 
-REPO=/home/yehray7217/turboquant-multigpu-svd
+REPO=$HOME/turboquant-multigpu-svd
 cd "${REPO}"
 
 echo "SVD method comparison"

@@ -24,7 +24,7 @@ algorithmic comparison for randomized SVD.
 If SLATE is not installed yet, set it up once:
 
 ```bash
-cd /home/yehray7217/turboquant-multigpu-svd/slate_baseline
+cd $HOME/turboquant-multigpu-svd/slate_baseline
 SLATE_BUILD_JOBS=2 ./start_background_setup.sh
 ./check_background_setup.sh
 ```
@@ -35,7 +35,7 @@ running and the log ends with `background setup done`.
 Then run the comparison:
 
 ```bash
-cd /home/yehray7217/turboquant-multigpu-svd
+cd $HOME/turboquant-multigpu-svd
 sbatch benchmark_compare/run_compare_svd_2gpu.slurm
 ```
 

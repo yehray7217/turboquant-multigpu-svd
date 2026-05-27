@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -eo pipefail
 
-BASE_DIR="/home/rax10101010/hpc_final/turboquant-multigpu-svd/slate_baseline"
+BASE_DIR="$HOME/hpc_final/turboquant-multigpu-svd/slate_baseline"
 LOG_FILE="${BASE_DIR}/background_setup.log"
 PID_FILE="${BASE_DIR}/background_setup.pid"
 

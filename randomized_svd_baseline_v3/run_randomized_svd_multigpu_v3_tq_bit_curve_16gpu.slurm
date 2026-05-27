@@ -19,7 +19,7 @@ module load openmpi/5.0.2_ucx1.14.1_cuda12.3
 unset OMPI_MCA_opal_cuda_support || true
 unset OMPI_MCA_btl_smcuda_use_cuda_ipc || true
 
-PROJECT_ROOT=/home/yehray7217/turboquant-multigpu-svd/randomized_svd_baseline_v3
+PROJECT_ROOT=$HOME/turboquant-multigpu-svd/randomized_svd_baseline_v3
 cd "$PROJECT_ROOT"
 
 make
