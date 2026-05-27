@@ -119,6 +119,11 @@ DeviceCompressedBlock quantize_fp32_device_block_to_device_payload(
     int* d_qjl_signs,
     cudaStream_t stream = 0);
 
+// blocks_per_sketch is a fixed internal constant (128) used by the QJL dot-product
+// kernel in the column TQ path. Pre-allocate d_qjl_partials as
+// (qjl_dim * kQjlColumnBlocksPerSketch) floats to avoid per-call cudaMalloc.
+static constexpr int kQjlColumnBlocksPerSketch = 128;
+
 DeviceCompressedBlock quantize_fp32_device_column_tq_to_device_payload(
     const float* d_values,
     int rows,
@@ -128,6 +133,11 @@ DeviceCompressedBlock quantize_fp32_device_column_tq_to_device_payload(
     float* d_work = nullptr,
     const signed char* d_signs = nullptr,
     int* d_qjl_signs = nullptr,
+    // Optional pre-allocated QJL scratch buffers (avoid per-call cudaMalloc in
+    // the hot loop). If null, the function allocates and frees them internally.
+    float* d_qjl_reconstructed = nullptr, // size: rows * cols floats
+    float* d_qjl_residual = nullptr,      // size: rows * cols floats
+    float* d_qjl_partials = nullptr,      // size: qjl_dim * kQjlColumnBlocksPerSketch floats
     cudaStream_t stream = 0);
 
 void dequantize_device_payload_to_fp32(

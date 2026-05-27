@@ -1363,6 +1363,9 @@ DeviceCompressedBlock quantize_fp32_device_column_tq_to_device_payload(
     float* d_external_work,
     const signed char* d_signs,
     int* d_qjl_signs,
+    float* d_qjl_reconstructed_ext,
+    float* d_qjl_residual_ext,
+    float* d_qjl_partials_ext,
     cudaStream_t stream) {
     if (!d_values) {
         throw std::runtime_error("Device input pointer is null.");
@@ -1444,8 +1447,11 @@ DeviceCompressedBlock quantize_fp32_device_column_tq_to_device_payload(
     check_cuda(cudaGetLastError(), "launch column TQ quantization kernel");
 
     float* d_reconstructed = nullptr;
+    bool d_reconstructed_owned = false;
     float* d_residual = nullptr;
+    bool d_residual_owned = false;
     float* d_qjl_partials = nullptr;
+    bool d_qjl_partials_owned = false;
     if (options.mode == QuantizeMode::kTurboQuantQjl &&
         options.qjl_dim > 0 &&
         options.qjl_alpha != 0.0f) {
@@ -1465,8 +1471,14 @@ DeviceCompressedBlock quantize_fp32_device_column_tq_to_device_payload(
         check_cuda(cudaGetLastError(), "launch column tq-qjl source dequantization kernel");
 
         const std::size_t count = static_cast<std::size_t>(rows) * cols;
-        check_cuda(cudaMalloc(&d_reconstructed, count * sizeof(float)),
-                   "cudaMalloc column tq-qjl reconstructed scratch");
+        // Use external pre-allocated buffer if provided; else allocate internally.
+        if (d_qjl_reconstructed_ext) {
+            d_reconstructed = d_qjl_reconstructed_ext;
+        } else {
+            check_cuda(cudaMalloc(&d_reconstructed, count * sizeof(float)),
+                       "cudaMalloc column tq-qjl reconstructed scratch");
+            d_reconstructed_owned = true;
+        }
         if (!d_signs && padded_rows <= 1024) {
             column_tq_inverse_fwht_store_kernel<<<cols, padded_rows, padded_rows * sizeof(float), stream>>>(
                 d_work, d_reconstructed, rows, cols, padded_rows, options.seed);
@@ -1489,7 +1501,14 @@ DeviceCompressedBlock quantize_fp32_device_column_tq_to_device_payload(
             check_cuda(cudaGetLastError(), "launch column tq-qjl inverse random-sign/truncate kernel");
         }
 
-        check_cuda(cudaMalloc(&d_residual, count * sizeof(float)), "cudaMalloc column tq-qjl residual");
+        // Use external pre-allocated buffer if provided; else allocate internally.
+        if (d_qjl_residual_ext) {
+            d_residual = d_qjl_residual_ext;
+        } else {
+            check_cuda(cudaMalloc(&d_residual, count * sizeof(float)),
+                       "cudaMalloc column tq-qjl residual");
+            d_residual_owned = true;
+        }
         blocks = static_cast<int>((count + threads - 1) / threads);
         residual_kernel<<<blocks, threads, 0, stream>>>(
             d_values, d_reconstructed, d_residual, count);
@@ -1502,15 +1521,22 @@ DeviceCompressedBlock quantize_fp32_device_column_tq_to_device_payload(
             SquareValue{},
             0.0f,
             thrust::plus<float>{});
+        // Must sync here to bring residual_norm to host (needed in block metadata).
         check_cuda(cudaStreamSynchronize(stream), "cudaStreamSynchronize column tq-qjl residual norm");
         block.residual_norm = std::sqrt(std::max(residual_norm2, 0.0f));
 
         const int qjl_threads = 256;
-        const int blocks_per_sketch = 128;
+        const int blocks_per_sketch = kQjlColumnBlocksPerSketch;
         const std::size_t partial_count =
             static_cast<std::size_t>(options.qjl_dim) * blocks_per_sketch;
-        check_cuda(cudaMalloc(&d_qjl_partials, partial_count * sizeof(float)),
-                   "cudaMalloc column tq-qjl partials");
+        // Use external pre-allocated buffer if provided; else allocate internally.
+        if (d_qjl_partials_ext) {
+            d_qjl_partials = d_qjl_partials_ext;
+        } else {
+            check_cuda(cudaMalloc(&d_qjl_partials, partial_count * sizeof(float)),
+                       "cudaMalloc column tq-qjl partials");
+            d_qjl_partials_owned = true;
+        }
         dim3 partial_grid(options.qjl_dim, blocks_per_sketch);
         qjl_dot_partial_kernel<<<partial_grid, qjl_threads, qjl_threads * sizeof(float), stream>>>(
             d_residual, d_qjl_partials, count, options.qjl_dim, blocks_per_sketch,
@@ -1521,13 +1547,16 @@ DeviceCompressedBlock quantize_fp32_device_column_tq_to_device_payload(
         check_cuda(cudaGetLastError(), "launch column tq-qjl pack signs kernel");
     }
 
+    // Sync required for QJL (ensures pack_signs kernel writes are visible) or when
+    // the work buffer is internally owned (must finish before we free it below).
     if (options.mode == QuantizeMode::kTurboQuantQjl || !d_external_work) {
         check_cuda(cudaStreamSynchronize(stream), "cudaStreamSynchronize column TQ quantization");
     }
 
-    if (d_qjl_partials) cudaFree(d_qjl_partials);
-    if (d_residual) cudaFree(d_residual);
-    if (d_reconstructed) cudaFree(d_reconstructed);
+    // Only free buffers that were allocated internally (not external pre-allocs).
+    if (d_qjl_partials_owned) cudaFree(d_qjl_partials);
+    if (d_residual_owned)     cudaFree(d_residual);
+    if (d_reconstructed_owned) cudaFree(d_reconstructed);
 
     if (!d_external_work) cudaFree(d_work);
     return block;
