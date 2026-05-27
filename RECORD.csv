@@ -1,0 +1,16 @@
+Method,Node,GPU,Matrix size,Node-local B payload,MPI B payload,Compression,Warm pipeline avg,B relative error,Speedup vs none
+none,1,8,32k x 8k,80 MiB,N/A,1.00x,46.891 ms,skipped,0.00%
+TQ 4-bit,1,8,32k x 8k,16.0001 MiB,N/A,5.00x,43.1142 ms,0.17184,8.10%
+TQ 2-bit,1,8,32k x 8k,8.00006 MiB,N/A,10.00x,42.3086 ms,0.947946,9.80%
+TQ+QJL 4-bit,1,8,32k x 8k,16.0098 MiB,N/A,5.00x,161.925 ms,0.258754,-245.30%
+TQ+QJL 2-bit,1,8,32k x 8k,8.00983 MiB,N/A,9.99x,160.999 ms,1.427272,-243.30%
+none,2,16,32k x 8k,160 MiB,20 MiB,1.00x,66.3761 ms,skipped,0.00%
+TQ 4-bit,2,16,32k x 8k,32.0001 MiB,4.00002 MiB,5.00x,49.8578 ms,0.175305,24.90%
+TQ 2-bit,2,16,32k x 8k,16.0001 MiB,2.00002 MiB,10.00x,47.7098 ms,0.952533,28.10%
+TQ+QJL 4-bit,2,16,32k x 8k,32.0197 MiB,4.00246 MiB,5.00x,205.19 ms,0.263931,-209.10%
+TQ+QJL 2-bit,2,16,32k x 8k,16.0197 MiB,2.00246 MiB,9.99x,204.344 ms,1.434003,-207.90%
+none,2,16,64k x 16k,320 MiB,40 MiB,1.00x,91.3809 ms,skipped,0.00%
+TQ 4-bit,2,16,64k x 16k,64.0001 MiB,8.00002 MiB,5.00x,71.1684 ms,0.1802,22.10%
+TQ 2-bit,2,16,64k x 16k,32.0001 MiB,4.00002 MiB,10.00x,64.7848 ms,0.960169,29.10%
+TQ+QJL 4-bit,2,16,64k x 16k,64.0197 MiB,8.00246 MiB,5.00x,379.724 ms,0.339721,-315.50%
+TQ+QJL 2-bit,2,16,64k x 16k,32.0197 MiB,4.00246 MiB,9.99x,370.227 ms,1.809998,-305.10%
