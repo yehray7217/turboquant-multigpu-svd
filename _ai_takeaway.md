@@ -99,6 +99,7 @@ turboquant-multigpu-svd/
 | `lowbit` | Per-block symmetric scalar quantization (8/4/2-bit)               |
 | `tq`     | Random Rademacher signs + FWHT rotation + low-bit quant + inverse |
 | `tq-qjl` | TQ + QJL residual 1-bit sign sketch correction (exploratory)      |
+| `fp16`   | Pure FP16 cast on B_i before P2P (2× compression, ~0.0002 rel-err) — v2 only |
 
 ### Key Optimizations Applied
 
@@ -135,6 +136,19 @@ turboquant-multigpu-svd/
 - B payload: 20 MiB → 4 MiB (4.99998× compression)
 - Pipeline: 50.22 ms → 50.11 ms (overhead ≈ negligible at this scale)
 - B relative error: 0.171
+
+**v2 1-node 8-GPU mode comparison (m=32768, n=8192, k=256, l=320, job 931176):**
+
+| Mode | Compression | B rel-err | Warm pipeline | `build_reduce_Bi` |
+|------|-------------|-----------|---------------|-------------------|
+| none | 1× | 0.000 | 45.38 ms | 9.96 ms |
+| **FP16** | **2×** | **0.000208** | **43.40 ms** | **6.78 ms** |
+| TQ 4-bit | 5× | 0.172 | 42.79 ms | 7.27 ms |
+| TQ 2-bit | 10× | 0.948 | 42.56 ms | 6.55 ms( fastest) |
+| TQ+QJL 4-bit | 5× | 0.468 | 68.39 ms | 32.75 ms |
+
+Singular value fidelity vs `none` (1.20972, ...):
+FP16 = identical, TQ 4-bit +0.7% bias, TQ 2-bit broken (0.350), TQ+QJL +5.4% bias.
 
 ---
 
@@ -211,8 +225,11 @@ Requires significant rewrite. Lower priority than fixing QJL.
 9. **QJL redesign**:
    - instead of sketching the residual after TQ, integrate QJL directly into the inner-product estimator for `B_i = Qᵢᵀ Aᵢ`.
    - This is the approach suggested in the paper but not yet implemented.
-10. **FP16 communication baseline**:
-    - add a half-precision $B_i$ reduction mode to compare TQ against the simpler FP16 alternative.
+10. **~~FP16 communication baseline~~ — DONE (job 931176)**:
+    - `--compress-b-mode fp16` added to v2: 2× compression, 0.0002 B-error, 43.4 ms warm pipeline.
+    - On the reduce step alone FP16 (6.78 ms) is actually faster than TQ 4-bit (7.27 ms),
+      but TQ 4-bit's 5× compression wins for multi-node where bandwidth dominates.
+    - Confirms TQ 4-bit is the right headline result. v3 multi-node FP16 port still TODO.
 11. **Tree all-reduce for MPI B**:
     - current v3 uses root gather/decode. A tree
       reduction would reduce communication latency at large node counts.

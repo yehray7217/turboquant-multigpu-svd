@@ -17,6 +17,7 @@
 // The communication hooks are the R_i TSQR gather and the B_i reduction.
 
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 #include <cublas_v2.h>
 #include <cusolverDn.h>
 #include <nvtx3/nvToolsExt.h>
@@ -132,8 +133,9 @@ static void print_usage(const char* prog) {
         << "  --oversample <int>    Oversampling p. l = k + p. Default: 16\n"
         << "  --ngpus <int>         Number of GPUs to use. Default: 1\n"
         << "  --seed <int>          RNG seed. Default: 1234\n"
-        << "  --compress-b-mode <none|lowbit|tq|tq-qjl>\n"
+        << "  --compress-b-mode <none|lowbit|tq|tq-qjl|fp16>\n"
         << "                        B_i compression mode. Default: none\n"
+        << "                        (fp16 is a 2x near-lossless baseline; ignores --compress-b-bits)\n"
         << "  --compress-b-bits <0|8|4|2>\n"
         << "                        B_i quantization bits. Default: 0\n"
         << "  --qjl-dim <int>       QJL residual sketch dimension for tq-qjl. Default: 256\n"
@@ -196,8 +198,14 @@ static Options parse_args(int argc, char** argv) {
     if (opt.k + opt.oversample > std::min(opt.m, opt.n)) {
         throw std::runtime_error("Require k + oversample <= min(m, n).");
     }
-    turboquant::QuantizeOptions qopt =
-        turboquant::make_quantize_options(opt.compress_b_bits, opt.compress_b_mode, opt.qjl_dim, opt.qjl_alpha, opt.seed);
+    if (opt.compress_b_mode == "fp16") {
+        if (opt.compress_b_bits != 0) {
+            throw std::runtime_error("--compress-b-mode=fp16 requires --compress-b-bits=0.");
+        }
+    } else {
+        turboquant::QuantizeOptions qopt =
+            turboquant::make_quantize_options(opt.compress_b_bits, opt.compress_b_mode, opt.qjl_dim, opt.qjl_alpha, opt.seed);
+    }
     return opt;
 }
 
@@ -281,6 +289,16 @@ static double fast_reconstruction_relative_error(
     return std::sqrt(static_cast<double>(err2 / std::max(static_cast<long double>(a_norm2), 1e-30L)));
 }
 
+__global__ void fp32_to_fp16_kernel(const float* src, __half* dst, size_t count) {
+    size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < count) dst[i] = __float2half_rn(src[i]);
+}
+
+__global__ void fp16_to_fp32_kernel(const __half* src, float* dst, size_t count) {
+    size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < count) dst[i] = __half2float(src[i]);
+}
+
 __global__ void transpose_colmajor_kernel(const float* src, float* dst, int rows, int cols) {
     int row = blockIdx.x * blockDim.x + threadIdx.x;
     int col = blockIdx.y * blockDim.y + threadIdx.y;
@@ -358,6 +376,7 @@ struct DeviceWork {
     float* d_Bi_qjl_reconstructed = nullptr; // tq-qjl: l x n reconstructed scratch
     float* d_Bi_qjl_residual = nullptr;      // tq-qjl: l x n residual scratch
     float* d_Bi_qjl_partials = nullptr;      // tq-qjl: qjl_dim * 128 partial sums
+    __half* d_Bi_fp16 = nullptr; // fp16 mode: l x n half-precision payload
     float* d_Uti_k = nullptr;    // l x k
     float* d_Ui = nullptr;       // mi x k
     int* d_info = nullptr;
@@ -381,6 +400,7 @@ static void destroy_work(DeviceWork& w) {
     if (w.d_Bi_qjl_reconstructed) cudaFree(w.d_Bi_qjl_reconstructed);
     if (w.d_Bi_qjl_residual) cudaFree(w.d_Bi_qjl_residual);
     if (w.d_Bi_qjl_partials) cudaFree(w.d_Bi_qjl_partials);
+    if (w.d_Bi_fp16) cudaFree(w.d_Bi_fp16);
     if (w.d_Uti_k) cudaFree(w.d_Uti_k);
     if (w.d_Ui) cudaFree(w.d_Ui);
     if (w.d_info) cudaFree(w.d_info);
@@ -449,11 +469,14 @@ int main(int argc, char** argv) {
         const int r_rows = opt.ngpus * l;
         const size_t b_count = static_cast<size_t>(l) * n;
         const size_t bi_fp32_bytes = b_count * sizeof(float);
-        const turboquant::QuantizeOptions b_quant_options =
-            turboquant::make_quantize_options(opt.compress_b_bits, opt.compress_b_mode, opt.qjl_dim, opt.qjl_alpha, opt.seed);
+        const bool compress_b_fp16 = (opt.compress_b_mode == "fp16");
+        const turboquant::QuantizeOptions b_quant_options = compress_b_fp16
+            ? turboquant::QuantizeOptions{}
+            : turboquant::make_quantize_options(opt.compress_b_bits, opt.compress_b_mode, opt.qjl_dim, opt.qjl_alpha, opt.seed);
         const bool compress_b_none = b_quant_options.mode == turboquant::QuantizeMode::kNone;
         const bool compress_b_tq = b_quant_options.mode == turboquant::QuantizeMode::kTurboQuant;
         const bool compress_b_qjl = b_quant_options.mode == turboquant::QuantizeMode::kTurboQuantQjl;
+        const size_t bi_fp16_bytes = b_count * sizeof(__half);
         const size_t bi_code_bytes = compress_b_none ? 0 :
             turboquant::device_code_bytes(l, n, b_quant_options);
         const size_t bi_qjl_sign_bytes = compress_b_qjl ?
@@ -480,6 +503,7 @@ int main(int argc, char** argv) {
         std::vector<float*> d_Bi_reduce_on_gpu0(opt.ngpus, nullptr);
         std::vector<std::uint8_t*> d_Bi_codes_on_gpu0(opt.ngpus, nullptr);
         std::vector<int*> d_Bi_qjl_signs_on_gpu0(opt.ngpus, nullptr);
+        std::vector<__half*> d_Bi_fp16_on_gpu0(opt.ngpus, nullptr);
         int lwork_r = 0;
         int lwork_svd = 0;
 
@@ -543,6 +567,9 @@ int main(int argc, char** argv) {
                                               qjl_partials_count * sizeof(float)));
                     }
                 }
+                if (compress_b_fp16) {
+                    CHECK_CUDA(cudaMalloc(&w.d_Bi_fp16, bi_fp16_bytes));
+                }
             }
             CHECK_CUDA(cudaSetDevice(0));
             for (int g = 1; g < opt.ngpus; ++g) {
@@ -552,6 +579,9 @@ int main(int argc, char** argv) {
                     if (compress_b_qjl) {
                         CHECK_CUDA(cudaMalloc(&d_Bi_qjl_signs_on_gpu0[g], bi_qjl_sign_bytes));
                     }
+                }
+                if (compress_b_fp16) {
+                    CHECK_CUDA(cudaMalloc(&d_Bi_fp16_on_gpu0[g], bi_fp16_bytes));
                 }
             }
             CHECK_CUDA(cudaMalloc(&d_info0, sizeof(int)));
@@ -808,7 +838,27 @@ int main(int argc, char** argv) {
                 Timer compress_timer;
                 compress_timer.tic();
                 size_t compressed_payload_bytes = bi_fp32_bytes;
-                if (compress_b_none) {
+                if (compress_b_fp16) {
+                    NvtxRange fp16_range("fp16_Bi_payload");
+                    const int threads_cvt = 256;
+                    const int blocks_cvt = static_cast<int>((b_count + threads_cvt - 1) / threads_cvt);
+                    fp32_to_fp16_kernel<<<blocks_cvt, threads_cvt>>>(w.d_Bi, w.d_Bi_fp16, b_count);
+                    CHECK_CUDA(cudaGetLastError());
+                    if (w.dev == 0) {
+                        fp16_to_fp32_kernel<<<blocks_cvt, threads_cvt>>>(w.d_Bi_fp16, w.d_Bi_hat, b_count);
+                        CHECK_CUDA(cudaGetLastError());
+                        d_reconstructed_Bi = w.d_Bi_hat;
+                    } else {
+                        CHECK_CUDA(cudaMemcpyPeer(
+                            d_Bi_fp16_on_gpu0[g], 0, w.d_Bi_fp16, w.dev, bi_fp16_bytes));
+                        CHECK_CUDA(cudaSetDevice(0));
+                        fp16_to_fp32_kernel<<<blocks_cvt, threads_cvt>>>(
+                            d_Bi_fp16_on_gpu0[g], d_Bi_reduce_on_gpu0[g], b_count);
+                        CHECK_CUDA(cudaGetLastError());
+                        d_reconstructed_Bi = d_Bi_reduce_on_gpu0[g];
+                    }
+                    compressed_payload_bytes = bi_fp16_bytes;
+                } else if (compress_b_none) {
                     d_reconstructed_Bi = w.d_Bi;
                     compressed_payload_bytes = bi_fp32_bytes;
                 } else if (!compress_b_none) {
@@ -928,8 +978,8 @@ int main(int argc, char** argv) {
                 }
 
                 CHECK_CUDA(cudaSetDevice(0));
-                float* d_Bi_hat_on_gpu0 = compress_b_none ? w.d_Bi : d_reconstructed_Bi;
-                if (w.dev != 0 && !decoded_payload_on_gpu0) {
+                float* d_Bi_hat_on_gpu0 = (compress_b_none && !compress_b_fp16) ? w.d_Bi : d_reconstructed_Bi;
+                if (w.dev != 0 && !decoded_payload_on_gpu0 && !compress_b_fp16) {
                     d_Bi_hat_on_gpu0 = d_Bi_reduce_on_gpu0[g];
                     CHECK_CUDA(cudaMemcpyPeer(
                         d_Bi_hat_on_gpu0,
@@ -1062,7 +1112,7 @@ int main(int argc, char** argv) {
             std::cout << "\nCommunication baseline\n"
                       << "  tsqr_R_payload_bytes      " << r_payload_bytes << "\n"
                       << "  tsqr_R_payload_MiB        " << (r_payload_bytes / 1024.0 / 1024.0) << "\n"
-                      << "  reduce_B_quant_mode       " << turboquant::mode_name(b_quant_options.mode) << "\n"
+                      << "  reduce_B_quant_mode       " << (compress_b_fp16 ? "fp16" : turboquant::mode_name(b_quant_options.mode)) << "\n"
                       << "  reduce_B_quant_bits       " << opt.compress_b_bits << "\n"
                       << "  reduce_B_qjl_dim          " << b_quant_options.qjl_dim << "\n"
                       << "  reduce_B_qjl_alpha        " << b_quant_options.qjl_alpha << "\n"
@@ -1141,6 +1191,9 @@ int main(int argc, char** argv) {
             if (p) cudaFree(p);
         }
         for (int* p : d_Bi_qjl_signs_on_gpu0) {
+            if (p) cudaFree(p);
+        }
+        for (__half* p : d_Bi_fp16_on_gpu0) {
             if (p) cudaFree(p);
         }
         cudaFree(d_info0);

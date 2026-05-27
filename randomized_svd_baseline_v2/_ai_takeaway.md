@@ -17,7 +17,7 @@ v3 is the multi-node MPI version of this same pipeline.
 
 | File | Description |
 |------|-------------|
-| `randomized_svd_multigpu_v2.cu` | ~1138 lines. Full TSQR pipeline + compression. Main source. |
+| `randomized_svd_multigpu_v2.cu` | Full TSQR pipeline + compression. Main source. Includes `fp16` mode (local; no turboquant dep). |
 | `Makefile` | Links against `../turboquant/turboquant.cu`. `nvcc -O3 -std=c++17 -arch=sm_70`. |
 | `README.md` | Comprehensive: compression options, timing policy, profiling guide. |
 | `OPTIMIZATION_HISTORY.md` | Copy of root OPTIMIZATION_HISTORY.md — same content. |
@@ -36,6 +36,9 @@ v3 is the multi-node MPI version of this same pipeline.
 | `run_randomized_svd_multigpu_v2_qjl_*.slurm` | Various QJL parameter explorations. |
 | `run_randomized_svd_multigpu_v2_tq_bit_curve_8gpu.slurm` | TQ curve on 8 GPUs. |
 | `run_multinode_gpu_visibility_probe.slurm` | Multi-node GPU visibility diagnostic. |
+| `run_qjl_fix_benchmark.slurm` | 1-node 8-GPU timing benchmark — used to verify the QJL pre-allocation fix (job 928869). |
+| `run_qjl_berror_postfix.slurm` | 1-node 8-GPU B-error check for QJL post-fix (job 928995 confirmed QJL is a dead end). |
+| `run_fp16_baseline.slurm` | NEW: 1-node 8-GPU benchmark adding `--compress-b-mode fp16` to the comparison (job 931176). |
 
 ---
 
@@ -103,7 +106,7 @@ sbatch run_randomized_svd_multigpu_v2_ncu.slurm   # kernel bottlenecks
 |--------|---------|
 | `--m`, `--n`, `--k`, `--oversample` | Matrix shape and rank |
 | `--ngpus <g>` | Number of GPUs |
-| `--compress-b-mode none\|lowbit\|tq\|tq-qjl` | Compression mode |
+| `--compress-b-mode none\|lowbit\|tq\|tq-qjl\|fp16` | Compression mode. `fp16` ignores `--compress-b-bits` (must be 0). |
 | `--compress-b-bits 8\|4\|2` | Bit width |
 | `--qjl-dim <d>` | QJL sketch dimension |
 | `--qjl-alpha <a>` | QJL correction strength (0.0 = TQ only) |
@@ -136,6 +139,24 @@ compress_Bi_time_ms        Time spent in compression kernels only
 | TQ 4-bit | 4.00 MiB | 4.99998× | 50.11 ms | 0.171 |
 | TQ 2-bit | 2.00 MiB | 9.99992× | 49.74 ms | 0.949 |
 | TQ+QJL 4-bit | 4.00 MiB | ~5× | 52.95 ms | worse than TQ |
+
+## Reference Results (8-GPU, m=32768, n=8192, k=256, l=320, job 931176)
+
+| Mode | Payload | Ratio | Warm Pipeline | `build_reduce_Bi` | B Error |
+|------|---------|-------|---------------|-------------------|---------|
+| none | 80 MiB | 1.00× | 45.38 ms | 9.96 ms | 0.000 |
+| **fp16** | **40 MiB** | **2.00×** | **43.40 ms** | **6.78 ms** | **0.000208** |
+| TQ 4-bit | 16.0 MiB | 4.99998× | 42.79 ms | 7.27 ms | 0.172 |
+| TQ 2-bit | 8.00 MiB | 9.99992× | 42.56 ms | 6.55 ms | 0.948 |
+| TQ+QJL 4-bit | 16.0 MiB | 4.99937× | 68.39 ms | 32.75 ms | 0.468 |
+
+Notes:
+- FP16 has the fastest `build_reduce_Bi` (P2P bytes halved) and singular values
+  identical to `none` (1.20972, ...) to 5 decimal places.
+- TQ 4-bit's singular values drift slightly (1.21848, +0.7% bias) — accuracy cost of compression.
+- Pipeline differences are small (42–45 ms) because at this matrix size the bottleneck is
+  SVD on GPU 0 (18 ms) + local QR (8–9 ms), not the reduce step. TQ's compression advantage
+  matters more at multi-node scale (v3).
 
 ---
 
