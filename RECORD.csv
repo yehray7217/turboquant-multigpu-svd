@@ -2,8 +2,10 @@ Method,Node,GPU,Matrix size,Node-local B payload,MPI B payload,Compression,Warm 
 none,1,8,32k x 8k,80 MiB,N/A,1.00x,46.891 ms,skipped,0.00%
 TQ 4-bit,1,8,32k x 8k,16.0001 MiB,N/A,5.00x,43.1142 ms,0.17184,8.10%
 TQ 2-bit,1,8,32k x 8k,8.00006 MiB,N/A,10.00x,42.3086 ms,0.947946,9.80%
-TQ+QJL 4-bit,1,8,32k x 8k,16.0098 MiB,N/A,5.00x,161.925 ms,0.258754,-245.30%
-TQ+QJL 2-bit,1,8,32k x 8k,8.00983 MiB,N/A,9.99x,160.999 ms,1.427272,-243.30%
+TQ+QJL 4-bit (BEFORE alloc fix),1,8,32k x 8k,16.0098 MiB,N/A,5.00x,161.925 ms,0.258754,-245.30%
+TQ+QJL 2-bit (BEFORE alloc fix),1,8,32k x 8k,8.00983 MiB,N/A,9.99x,160.999 ms,1.427272,-243.30%
+TQ+QJL 4-bit (AFTER alloc fix),1,8,32k x 8k,16.002 MiB,N/A,4.999x,69.230 ms,0.467929,-48.30%
+TQ+QJL 2-bit (AFTER alloc fix),1,8,32k x 8k,8.002 MiB,N/A,9.998x,68.255 ms,skipped,-46.30%
 none,2,16,32k x 8k,160 MiB,20 MiB,1.00x,66.3761 ms,skipped,0.00%
 TQ 4-bit,2,16,32k x 8k,32.0001 MiB,4.00002 MiB,5.00x,49.8578 ms,0.175305,24.90%
 TQ 2-bit,2,16,32k x 8k,16.0001 MiB,2.00002 MiB,10.00x,47.7098 ms,0.952533,28.10%
