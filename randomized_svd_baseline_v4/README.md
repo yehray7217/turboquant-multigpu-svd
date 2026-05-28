@@ -51,19 +51,19 @@ TurboQuant 的演算法要能成功，有一個重要性質是，做旋轉變換
 
 誤差測量有兩個指標：
 - `B Relative Error`：測量 TurboQuant 壓縮並解壓縮 `B_i` 之後，跟原本的 `B_i` 差多少。公式：
-  ```math
-  \frac{\lVert B' - B \rVert_F}{\lVert B \rVert_F}
-  ```
+```math
+\frac{\lVert B' - B \rVert_F}{\lVert B \rVert_F}
+```
 - `Final Reconstruction Error`：測量最終的 Randomized SVD 近似 $A$ 矩陣的誤差。
-  ```math
-  \sqrt{
-    \frac{
-      \lVert A \rVert_F^2 - \sum_{i=1}^{k} \hat{\sigma}_i^2
-    }{
-      \lVert A \rVert_F^2
-    }
+```math
+\sqrt{
+  \frac{
+    \lVert A \rVert_F^2 - \sum_{i=1}^{k} \hat{\sigma}_i^2
+  }{
+    \lVert A \rVert_F^2
   }
-  ```
+}
+```
   其中 $\hat{\sigma}_i$ 是 randomized SVD 最後從小矩陣 $B=Q^TA$ 做 SVD 得到的 singular values。
 
 舊的呈現 `Final Reconstruction Error` 的方式是直接顯示誤差是多少 %。
