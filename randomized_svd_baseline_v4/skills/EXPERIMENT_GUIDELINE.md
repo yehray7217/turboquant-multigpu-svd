@@ -9,8 +9,8 @@ This guideline is for teammates and their AI assistants when creating, running, 
 Before starting an experiment, give the AI both files:
 
 ```text
-project-context/PROJECT_CONTEXT.md
-project-context/EXPERIMENT_GUIDELINE.md
+skills/PROJECT_CONTEXT.md
+skills/EXPERIMENT_GUIDELINE.md
 ```
 
 The AI should follow the structure and conventions below unless the human explicitly overrides them.
@@ -359,8 +359,8 @@ Manipulated variable:
 
 Please create:
 - README.md
-- ctrl_group.slurm
-- exp_group.slurm
+- ctrl.slurm
+- exp.slurm
 - output_logs/
 - error_logs/
 

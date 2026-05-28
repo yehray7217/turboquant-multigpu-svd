@@ -357,21 +357,23 @@ Current folder structure:
 randomized_svd_baseline_v4/
 ├── randomized_svd_multigpu_v4.cu
 ├── Makefile
-├── project-context/
-│   └── PROJECT_CONTEXT.md
-├── OPTIMIZATION_HISTORY.md
+├── README.md
+├── TODO.md
+├── skills/
+│   ├── PROJECT_CONTEXT.md
+│   └── EXPERIMENT_GUIDELINE.md
 ├── .build/
 ├── exp_subspace_iteration/
 │   ├── README.md
-│   ├── ctrl_group.slurm
-│   ├── exp_group.slurm
-│   ├── exp_group2.slurm
+│   ├── ctrl.slurm
+│   ├── exp.slurm
+│   ├── exp2.slurm
 │   ├── output_logs/
 │   └── error_logs/
 └── exp_subspace_stabilization/
     ├── README.md
-    ├── ctrl_group.slurm
-    ├── exp_group.slurm
+    ├── ctrl.slurm
+    ├── exp.slurm
     ├── output_logs/
     └── error_logs/
 ```
