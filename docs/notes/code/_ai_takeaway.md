@@ -13,6 +13,8 @@ CUDA pipeline.
 | File | Description |
 |------|-------------|
 | `sv-distribution-image.py` | Plots singular value spectrum of real image data (LFW faces from scikit-learn). Shows rapid decay and demonstrates that ~1/8 of singular values preserve 99.9% energy. |
+| `randomized-svd/cpu-single-core.cpp` | NEW (v4): single-core C++ reference implementation of randomized SVD with synthetic decay test matrices (exponential/polynomial/step). The CPU oracle for the GPU pipeline's algorithm and accuracy metric. |
+| `randomized-svd/run.sh` | NEW (v4): helper that compiles (`g++ -std=c++17 -O2`) and runs a single-file C++ source with passthrough args. |
 
 ---
 

@@ -52,13 +52,20 @@ turboquant-multigpu-svd/
 ├── randomized_svd_baseline/   Baseline B v1: partial multi-GPU, compression at Y_i gather
 ├── randomized_svd_baseline_v2/  v2: TSQR-style, compression at B_i reduction (primary)
 ├── randomized_svd_baseline_v3/  v3: MPI multi-node compressed collectives (final claim)
+├── randomized_svd_baseline_v4/  NEW (v4): subspace iteration + synthetic spectra + RHT validation
+│   ├── randomized_svd_multigpu_v4.cu   v4 pipeline (--subspace-iter, --spectrum-decay-mode)
+│   ├── exp_subspace_iteration/         experiment: does subspace iteration pay for itself?
+│   ├── exp_subspace_stabilization/     experiment: QR-stabilized Z (negative result)
+│   └── skills/                         PROJECT_CONTEXT.md + EXPERIMENT_GUIDELINE.md (AI/teammate handoff)
 ├── turboquant/             Shared compression kernel library (TQ + QJL CUDA kernels)
 ├── slate_baseline/         SLATE library naive randomized SVD (library-level reference)
 ├── benchmark_compare/      Scripts to compare cuSOLVER vs SLATE vs v2 side-by-side
 ├── docs/notes/             Theory notes (SVD, Randomized SVD, TurboQuant)
-│   └── potential_problem_for_power_iteration.md  NEW: power iteration QR stability fix
-├── RECORD.csv              NEW: benchmark result log across all modes and node counts
-└── _agent_readme.md        NEW: agent work log (plan / results / conclusions)
+│   ├── potential_problem_for_power_iteration.md  power iteration QR stability fix
+│   ├── code/randomized-svd/            NEW: single-core CPU rSVD reference (cpu-single-core.cpp)
+│   ├── rht-distribution-test/          NEW: RHT-rotation normality validation (rht_distribution.png)
+│   └── sv-spectrum-investigation/      NEW: singular spectra of real NLP/TF-IDF matrices
+└── RECORD.csv              benchmark result log across all modes and node counts
 ```
 
 ---
@@ -87,6 +94,17 @@ turboquant-multigpu-svd/
   - Cross-node $B$ reduction uses compressed gather/decode instead of FP32 MPI_Reduce.
   - Tested up to 16 GPUs (2 nodes × 8 GPUs, Slurm QoS limit).
   - Loop 4 adds the QJL pre-alloc fix verification and an FP16 MPI baseline on 16 GPUs.
+
+- **Randomized SVD v4** (collaborator: pbr03617 / Gino):
+  - Experiment framework on top of the v2/v3 pipeline.
+  - Adds **subspace iteration** (`--subspace-iter q`): early finding is `q=1` is best;
+    overhead grows because TQ is only applied to `B`, not yet to the `Z = Σ Aᵢᵀ Qᵢ` reduce.
+  - Adds **synthetic spectrum test matrices** (`--spectrum-decay-mode random|polynomial|exponential`)
+    so the input `A` has realistic fast-decaying singular values, not the flat spectrum of pure Gaussian input.
+  - **RHT validation**: confirmed TurboQuant's rotation can use random-sign + FWHT (RHT) and still
+    produce Gaussian per-component distributions (see `docs/notes/rht-distribution-test/`).
+  - New accuracy metric: theoretical error + error ratio (our error / theoretical error).
+  - Details: `randomized_svd_baseline_v4/README.md`, `randomized_svd_baseline_v4/skills/PROJECT_CONTEXT.md`.
 
 - **SLATE naive baseline**:
   - Unoptimized SLATE R(randomized)SVD with `Lookahead=0`, `nb=256`.
@@ -210,7 +228,8 @@ Add the corresponding frees and a forced `cudaStreamSynchronize` for residual no
 
 **Fix**: pre-allocate these scratch buffers in setup (alongside the existing
 `d_Bi_tq_work`), pass them as optional external pointers to the compress function.
-This is implemented in `_agent_readme.md` Loop 1.
+This is implemented and benchmarked in `OPTIMIZATION_HISTORY.md` §13.1 (v2 8-GPU
+TQ+QJL 161.9 → 69.2 ms, −57%; verified on v3 16-GPU in §13.4).
 
 ### 3. NCCL (to replace MPI) — Future Work
 
@@ -232,11 +251,13 @@ Requires significant rewrite. Lower priority than fixing QJL.
 9. **QJL redesign**:
    - instead of sketching the residual after TQ, integrate QJL directly into the inner-product estimator for `B_i = Qᵢᵀ Aᵢ`.
    - This is the approach suggested in the paper but not yet implemented.
-10. **~~FP16 communication baseline~~ — DONE (job 931176)**:
-    - `--compress-b-mode fp16` added to v2: 2× compression, 0.0002 B-error, 43.4 ms warm pipeline.
+10. **~~FP16 communication baseline~~ — DONE (jobs 931176, 931564)**:
+    - `--compress-b-mode fp16` added to v2 (P2P): 2× compression, 0.0002 B-error, 43.4 ms warm pipeline.
     - On the reduce step alone FP16 (6.78 ms) is actually faster than TQ 4-bit (7.27 ms),
       but TQ 4-bit's 5× compression wins for multi-node where bandwidth dominates.
-    - Confirms TQ 4-bit is the right headline result. v3 multi-node FP16 port still TODO.
+    - **v3 multi-node FP16 MPI gather port also DONE** (Loop 4 A2, §13.4): −4.5% at 32k×8k,
+      ~0% at 64k×16k (root-side sequential decode loop negates the halved bytes at the larger size).
+    - Confirms TQ 4-bit is the right headline result.
 11. **Tree all-reduce for MPI B**:
     - current v3 uses root gather/decode. A tree
       reduction would reduce communication latency at large node counts.
@@ -252,8 +273,9 @@ Requires significant rewrite. Lower priority than fixing QJL.
 
 | File                                   | Why                                                    |
 | -------------------------------------- | ------------------------------------------------------ |
-| `OPTIMIZATION_HISTORY.md`              | Complete experiment log with all results and decisions |
+| `OPTIMIZATION_HISTORY.md`              | Complete experiment log (v2/v3, Loops 1–4) with all results and decisions |
 | `randomized_svd_baseline_v3/README.md` | Current final claims and result tables                 |
+| `randomized_svd_baseline_v4/skills/PROJECT_CONTEXT.md` | Latest v4 status: subspace iteration, synthetic spectra, RHT |
 | `turboquant/turboquant.hpp`            | Public API for all compression modes                   |
 | `randomized_svd_baseline_v2/README.md` | Compression options, timing policy, profiling guide    |
 | `docs/notes/Randomized_SVD.md`         | Algorithm theory with pseudocode                       |
