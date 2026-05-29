@@ -15,7 +15,10 @@ project. Read these before diving into the CUDA source code.
 | `SVD.md` | Core SVD theory: orthogonal matrices, eigendecomposition, SVD definition, cuSOLVER implementation details. |
 | `Randomized_SVD.md` | Randomized SVD algorithm: low-rank approximation, algorithm steps, power iteration, pseudocode, accuracy analysis. |
 | `TurboQuant.md` | TurboQuant + QJL theory — currently marked "施工中" (under construction). |
-| `code/` | Supporting Python scripts (singular value spectrum visualization). |
+| `potential_problem_for_power_iteration.md` | Why naive `Y = A(AᵀY)` power iteration is unstable and the QR-interleaved fix. |
+| `code/` | Supporting Python scripts (singular value spectrum visualization) + `code/randomized-svd/` single-core CPU rSVD reference. |
+| `rht-distribution-test/` | NEW (v4): validates that RHT rotation (random sign + FWHT) makes vector components Gaussian. `rht-distribution.py` → `rht_distribution.png`. |
+| `sv-spectrum-investigation/` | NEW (v4): singular spectra of real NLP/TF-IDF matrices, motivating the synthetic spectrum-decay test generator. `calc-sv-from-NLP-dataset.py`, `draw-sv.py`, `sv-of-NLP-data-set.npz`. |
 | `img/` | Figures and diagrams referenced by the markdown notes. |
 
 ---

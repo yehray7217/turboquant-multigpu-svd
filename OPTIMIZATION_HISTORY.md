@@ -81,6 +81,25 @@ it was tried, what data was collected, and what conclusion we kept.
       - [Change](#change-12)
       - [Result](#result-6)
       - [Conclusion](#conclusion-12)
+  - [13. Pre-Allocation Fix, FP16 Baseline, and Multi-Node Verification (Loops 1–4)](#13-pre-allocation-fix-fp16-baseline-and-multi-node-verification-loops-14)
+    - [13.1 Pre-Allocate QJL/Residual Scratch Buffers](#131-pre-allocate-qjlresidual-scratch-buffers)
+      - [Change](#change-13)
+      - [Reason](#reason-10)
+      - [Result](#result-7)
+      - [Conclusion](#conclusion-13)
+    - [13.2 QJL Post-Fix Accuracy — Confirmed Dead End](#132-qjl-post-fix-accuracy--confirmed-dead-end)
+      - [Change](#change-14)
+      - [Result](#result-8)
+      - [Conclusion](#conclusion-14)
+    - [13.3 FP16 Near-Lossless B Baseline](#133-fp16-near-lossless-b-baseline)
+      - [Change](#change-15)
+      - [Reason](#reason-11)
+      - [Result](#result-9)
+      - [Conclusion](#conclusion-15)
+    - [13.4 v3 Multi-Node Verify and FP16 MPI Port](#134-v3-multi-node-verify-and-fp16-mpi-port)
+      - [Change](#change-16)
+      - [Result](#result-10)
+      - [Conclusion](#conclusion-16)
   - [Current Best Result](#current-best-result)
   - [Recommended Next Experiments](#recommended-next-experiments)
 
@@ -158,6 +177,7 @@ The currently implemented `B_i` compression modes are:
 | lowbit | `--compress-b-mode lowbit` | Direct scalar low-bit quantization. |
 | TQ | `--compress-b-mode tq` | Random sign + FWHT rotation + low-bit quantization + inverse rotation. |
 | TQ+QJL | `--compress-b-mode tq-qjl` | TQ plus experimental QJL residual correction. |
+| fp16 | `--compress-b-mode fp16` | Pure FP16 cast of `B_i` (2× compression, near-lossless). Added in Loop 3/4; ignores `--compress-b-bits` (must be 0). |
 
 The main TurboQuant kernels currently do the following on GPU:
 
@@ -885,6 +905,156 @@ This is another TQ-specific improvement. It benefits 2-bit more than 4-bit,
 which is consistent with decode/pack overhead becoming more visible at lower
 payload sizes.
 
+## 13. Pre-Allocation Fix, FP16 Baseline, and Multi-Node Verification (Loops 1–4)
+
+This section records four follow-up iterations done after the §12 kernel work. They
+diagnose and remove the catastrophic TQ+QJL slowdown, re-confirm QJL as a dead end at
+larger GPU counts, add a near-lossless FP16 baseline, and verify both findings at v3
+multi-node scale.
+
+Unless noted, runs use the standard timing policy: `--repeat 100`,
+`--device-random-input`, `--skip-form-u`, `--no-check-error`, `--no-check-b-error`, with
+a separate short pass for B-error.
+
+### 13.1 Pre-Allocate QJL/Residual Scratch Buffers
+
+#### Change
+
+`quantize_fp32_device_column_tq_to_device_payload` was being called once per GPU column
+in the hot loop, and each call unconditionally `cudaMalloc`'d three GPU scratch buffers
+(`d_reconstructed`, `d_residual`, `d_qjl_partials`) and freed them at the end. This is
+distinct from the §12.1 tail-sync removal: here the cost is the per-call allocation churn
+in the QJL path itself.
+
+The fix adds three optional external scratch-buffer parameters to that function
+(`turboquant/turboquant.hpp` + `.cu`); when non-null they are used and the internal
+alloc/free is skipped. `DeviceWork` in v2 and v3 gains the three fields, pre-allocates
+them in `setup_device_work()` alongside `d_Bi_tq_work`, passes them on the hot path, and
+frees them in `destroy_device_work()`.
+
+#### Reason
+
+With 8 GPUs processed sequentially, `8 GPUs × 3 allocs × ~2 ms/alloc ≈ 48 ms` per
+iteration, plus matching `cudaFree` and a forced `cudaStreamSynchronize` for the residual
+norm → ~120 ms of pure overhead. This fully explained the pre-fix v2 8-GPU TQ+QJL at
+161.9 ms vs TQ 4-bit at 43.1 ms.
+
+#### Result
+
+v2 8-GPU (job 928869), m=32768, n=8192, k=256:
+
+| Mode | Before fix | After fix | Δ |
+| --- | ---: | ---: | ---: |
+| TQ+QJL 4-bit | 161.9 ms | 69.23 ms | −57.3% |
+| TQ+QJL 2-bit | 161.0 ms | 68.26 ms | −57.6% |
+| TQ 4-bit (control) | 43.1 ms | 43.1 ms | 0% |
+
+#### Conclusion
+
+The pre-allocation fix removed ~92 ms of per-iteration overhead. TQ+QJL is now 69 ms vs
+TQ's 43 ms — no longer catastrophically broken, though still ~1.6× slower than pure TQ.
+The remaining gap is the intrinsic QJL computation cost, not allocation overhead.
+
+### 13.2 QJL Post-Fix Accuracy — Confirmed Dead End
+
+#### Change
+
+After removing the overhead in §13.1, re-ran the QJL accuracy experiments from §7–§8 on
+8 GPUs (jobs 928995 and the alpha/dim sweeps) to check whether QJL was ever worth its
+intrinsic cost.
+
+#### Result
+
+- Any nonzero `qjl_alpha` monotonically worsened `reduce_B_relative_error`; best result
+  was always `alpha=0` (equivalent to pure TQ), reproducing the §7 alpha-grid finding at
+  8 GPUs.
+- No `qjl_dim` setting (64 → l=320) improved error below the TQ-only baseline.
+- Gaussian QJL samples (§8) made no meaningful difference: TQ+QJL 4-bit B error = 0.468
+  vs TQ 4-bit = 0.172 — the ~3× gap persisted regardless of sign distribution.
+
+#### Conclusion
+
+QJL is a confirmed dead end for this use case. The TQ residual is near-zero in
+expectation and the 1-bit sign sketch adds noise that dominates the small residual signal
+at these bit widths. The right lever for better accuracy is more bits (TQ 8-bit), not
+QJL. Kept as a documented negative result.
+
+### 13.3 FP16 Near-Lossless B Baseline
+
+#### Change
+
+Added `--compress-b-mode fp16` to v2: two small CUDA kernels
+(`fp32_to_fp16_kernel` / `fp16_to_fp32_kernel`) cast `B_i` to half precision before the
+per-GPU P2P accumulate and back on GPU 0. FP16 is intercepted before
+`make_quantize_options` (turboquant rejects unknown modes); it requires
+`--compress-b-bits 0` and runs the local accumulate loop in FP32.
+
+#### Reason
+
+A near-lossless 2× compression point sits between `none` and TQ 4-bit on the
+compression-vs-accuracy curve, and motivates the multi-node comparison in §13.4.
+
+#### Result
+
+v2 1-node 8-GPU (job 931176), m=32768, n=8192, k=256, l=320:
+
+| Mode | Payload | Compression | Warm Pipeline | `build_reduce_Bi` | B Error |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| none | 80 MiB | 1.00× | 45.38 ms | 9.96 ms | 0.000 |
+| fp16 | 40 MiB | 2.00× | 43.40 ms | 6.78 ms | 0.000208 |
+| TQ 4-bit | 16.0 MiB | 4.99998× | 42.79 ms | 7.27 ms | 0.172 |
+| TQ 2-bit | 8.00 MiB | 9.99992× | 42.56 ms | 6.55 ms | 0.948 |
+| TQ+QJL 4-bit | 16.0 MiB | 4.99937× | 68.39 ms | 32.75 ms | 0.468 |
+
+FP16 has the fastest `build_reduce_Bi` (6.78 ms) and singular values identical to `none`
+to 5 decimal places.
+
+#### Conclusion
+
+FP16 is a clean near-lossless baseline. At 1-node P2P scale all modes are close (42–45 ms)
+because the bottleneck is SVD on GPU 0 + local QR, not the reduce step. The real test of
+compression advantage is multi-node (§13.4), where the B payload crosses the network.
+
+### 13.4 v3 Multi-Node Verify and FP16 MPI Port
+
+#### Change
+
+Two sub-tasks on v3 (2 nodes, 16 GPUs):
+
+- **A1 (verify):** benchmark-only confirmation that the §13.1 fix (applied to v3 at the
+  same time as v2) reduces v3 TQ+QJL time. RECORD.csv had only pre-fix v3 numbers.
+- **A2 (port):** port the §13.3 FP16 mode from v2's P2P path to v3's `MPI_Gather` path
+  (~88 lines in `randomized_svd_multigpu_v3.cu`). FP16 payloads use `MPI_BYTE` with an
+  explicit byte count, avoiding a custom MPI half type; root decodes per-rank via a
+  sequential H2D → fp16→fp32 → add loop.
+
+#### Result
+
+A1 — TQ+QJL post-fix (100 repeats):
+
+| Matrix | Pre-fix | Post-fix | Δ |
+| --- | ---: | ---: | ---: |
+| 32k×8k | 205 ms | 82.69 ms | −59.7% |
+| 64k×16k | 379 ms | 133.56 ms | −64.8% |
+
+A2 — FP16 vs TQ on warm pipeline (job 931564):
+
+| Mode | 32k×8k | MPI B | 64k×16k | MPI B |
+| --- | ---: | ---: | ---: | ---: |
+| none | 66.49 ms | 20 MiB | 89.72 ms | 40 MiB |
+| fp16 | 63.49 ms (−4.5%) | 10 MiB | 90.24 ms (~0%) | 20 MiB |
+| TQ 4-bit | 49.09 ms (−26.2%) | 4 MiB | 71.52 ms (−20.3%) | 8 MiB |
+| TQ 2-bit | 46.95 ms (−29.4%) | 2 MiB | 64.20 ms (−28.5%) | 4 MiB |
+
+#### Conclusion
+
+The §13.1 fix is confirmed at multi-node scale (TQ+QJL −60/−65%), but even post-fix QJL
+stays slower than `none` — a dead end at both scales. FP16's 2× payload reduction helps
+at 32k×8k (−4.5%) but is fully negated at 64k×16k (~0%): the root-side sequential decode
+loop doubles in iterations and offsets the halved bytes. TQ 4-bit wins at both sizes
+because its 5× compression leaves net savings even with a similar decode loop. This
+re-confirms the headline: **v3 TQ 4-bit on 16 GPUs gives −20.3% at 64k×16k**.
+
 ## Current Best Result
 
 The best current multi-node result to present is:
@@ -931,13 +1101,29 @@ Warm pipeline avg: 49.7375 ms
 B relative error: 0.948631
 ```
 
+The near-lossless reference point (see §13.3 / §13.4) is:
+
+```text
+Method: FP16 cast of B / 2x compression
+v2 1-node 8-GPU: 43.40 ms warm pipeline, B error 0.000208
+v3 2-node 16-GPU 64k×16k: 90.24 ms (~0% vs none), MPI B 40 -> 20 MiB
+Singular values identical to none to 5 decimal places.
+```
+
+FP16 is the most accurate compressed mode, but its 2× payload reduction does not beat
+TQ 4-bit's 5× at multi-node scale, so TQ 4-bit remains the headline.
+
 The negative result is:
 
 ```text
 TQ+QJL currently does not reduce error at the same bit width.
 Nonzero alpha worsens B error in tested grids.
 Large qjl_dim increases compression time substantially.
+Even post-fix (§13.1), TQ+QJL stays slower than none at both v2 and v3 scale.
 ```
+
+The §13 work (Loops 1–4) is folded into the results above: the v3 numbers include the
+QJL pre-allocation fix, and FP16 is now available on both v2 (P2P) and v3 (MPI gather).
 
 ## Recommended Next Experiments
 
