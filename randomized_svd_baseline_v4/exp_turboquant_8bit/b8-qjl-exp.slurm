@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=rsvd_v4_tq8_exp
+#SBATCH --job-name=rsvd_v4_tq8_qjl_exp
 #SBATCH --account=ACD115064
 #SBATCH --partition=nycugpu_queue
 #SBATCH --nodes=2
@@ -7,8 +7,8 @@
 #SBATCH --cpus-per-task=32
 #SBATCH --gpus-per-node=8
 #SBATCH --time=01:00:00
-#SBATCH --output=/work/pbr03617/turboquant-multigpu-svd/randomized_svd_baseline_v4/exp_turboquant_8bit/output_logs/b8-exp.out
-#SBATCH --error=/work/pbr03617/turboquant-multigpu-svd/randomized_svd_baseline_v4/exp_turboquant_8bit/error_logs/b8-exp.err
+#SBATCH --output=/work/pbr03617/turboquant-multigpu-svd/randomized_svd_baseline_v4/exp_turboquant_8bit/output_logs/b8-qjl-exp.out
+#SBATCH --error=/work/pbr03617/turboquant-multigpu-svd/randomized_svd_baseline_v4/exp_turboquant_8bit/error_logs/b8-qjl-exp.err
 
 set -euo pipefail
 
@@ -40,14 +40,14 @@ BASE_ARGS=(
     --subspace-iter 1
     --device-random-input
     --skip-form-u
-    --compress-b-mode tq
+    --compress-b-mode tq-qjl
     --compress-b-bits 8
-    --compress-subspace-mode tq
+    --compress-subspace-mode tq-qjl
     --compress-subspace-bits 8
     --summary-only
 )
 
-echo "Starting experiment group: TQ 8-bit"
+echo "Starting experiment group: TQ+QJL 8-bit"
 echo "Date: $(date)"
 echo "Host: $(hostname)"
 echo "SLURM_JOB_NODELIST=${SLURM_JOB_NODELIST}"

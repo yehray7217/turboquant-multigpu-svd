@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=rsvd_v4_tq8_exp
+#SBATCH --job-name=rsvd_v4_tq4_exp
 #SBATCH --account=ACD115064
 #SBATCH --partition=nycugpu_queue
 #SBATCH --nodes=2
@@ -27,8 +27,8 @@ make
 cd "${PROJECT_ROOT}/exp_turboquant_8bit"
 
 BASE_ARGS=(
-    --m 32768
-    --n 8192
+    --m 65536
+    --n 16384
     --k 250
     --oversample 6
     --ngpus 16
@@ -47,7 +47,7 @@ BASE_ARGS=(
     --summary-only
 )
 
-echo "Starting experiment group: B-only TQ 8-bit"
+echo "Starting experiment group: TQ 4-bit"
 echo "Date: $(date)"
 echo "Host: $(hostname)"
 echo "SLURM_JOB_NODELIST=${SLURM_JOB_NODELIST}"

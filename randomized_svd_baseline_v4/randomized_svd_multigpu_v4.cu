@@ -163,11 +163,11 @@ static void print_usage(const char* prog) {
         << "  --compress-b-mode <none|lowbit|tq|tq-qjl>\n"
         << "                        B_i compression mode. Default: none\n"
         << "  --compress-b-bits <0|2..8>\n"
-        << "                        B_i quantization bits. mode=tq supports 2..8; lowbit/tq-qjl support 2/4/8. Default: 0\n"
+        << "                        B_i quantization bits. mode=tq supports 2..8; tq-qjl supports 3..8; lowbit supports 2/4/8. Default: 0\n"
         << "  --compress-subspace-mode <none|lowbit|tq|tq-qjl>\n"
         << "                        Z = A^T Q compression mode inside subspace iteration. Default: none\n"
         << "  --compress-subspace-bits <0|2..8>\n"
-        << "                        Z = A^T Q quantization bits. mode=tq supports 2..8; lowbit/tq-qjl support 2/4/8. Default: 0\n"
+        << "                        Z = A^T Q quantization bits. mode=tq supports 2..8; tq-qjl supports 3..8; lowbit supports 2/4/8. Default: 0\n"
         << "  --qjl-dim <int>       QJL residual sketch dimension for tq-qjl. Default: 256\n"
         << "  --qjl-alpha <float>   QJL residual correction strength. Default: 1.0\n"
         << "  --device-random-input\n"
@@ -616,11 +616,16 @@ struct DeviceWork {
     float* d_Qi = nullptr;       // mi x l
     float* d_Zi = nullptr;       // n x l local A_i^T Q_i contribution
     float* d_Z = nullptr;        // n x l global reduced subspace iterate
+    float* d_ZT = nullptr;       // l x n transpose of Z_i for row-vector TQ
+    std::uint8_t* d_Z_codes = nullptr; // compressed row-vector Z_i payload
+    float* d_Z_norms = nullptr;        // per-row norms for Lloyd-Max TQ on Z_i
+    std::uint8_t* d_Z_qjl_signs = nullptr; // packed QJL signs for row-vector Z_i
+    float* d_Z_tq_work = nullptr;      // row-vector tq encode scratch
     float* d_Bi = nullptr;       // l x n
     float* d_Bi_hat = nullptr;   // l x n reconstructed B_i after optional compression
     std::uint8_t* d_Bi_codes = nullptr; // compressed B_i payload
     float* d_Bi_norms = nullptr;        // per-column norms for Lloyd-Max TQ
-    int* d_Bi_qjl_signs = nullptr;      // tq-qjl residual signs
+    std::uint8_t* d_Bi_qjl_signs = nullptr; // tq-qjl packed residual signs
     float* d_Bi_tq_work = nullptr;      // column-wise tq encode scratch
     float* d_Uti_k = nullptr;    // l x k
     float* d_Ui = nullptr;       // mi x k
@@ -641,6 +646,11 @@ static void destroy_work(DeviceWork& w) {
     if (w.d_Qi) cudaFree(w.d_Qi);
     if (w.d_Zi) cudaFree(w.d_Zi);
     if (w.d_Z) cudaFree(w.d_Z);
+    if (w.d_ZT) cudaFree(w.d_ZT);
+    if (w.d_Z_codes) cudaFree(w.d_Z_codes);
+    if (w.d_Z_norms) cudaFree(w.d_Z_norms);
+    if (w.d_Z_qjl_signs) cudaFree(w.d_Z_qjl_signs);
+    if (w.d_Z_tq_work) cudaFree(w.d_Z_tq_work);
     if (w.d_Bi) cudaFree(w.d_Bi);
     if (w.d_Bi_hat) cudaFree(w.d_Bi_hat);
     if (w.d_Bi_codes) cudaFree(w.d_Bi_codes);
@@ -783,14 +793,17 @@ int main(int argc, char** argv) {
                 opt.qjl_alpha,
                 opt.seed + 7919u);
         const bool compress_b_none = b_quant_options.mode == turboquant::QuantizeMode::kNone;
-        const bool compress_b_tq = b_quant_options.mode == turboquant::QuantizeMode::kTurboQuant;
         const bool compress_b_qjl = b_quant_options.mode == turboquant::QuantizeMode::kTurboQuantQjl;
+        const bool compress_b_tq =
+            b_quant_options.mode == turboquant::QuantizeMode::kTurboQuant ||
+            b_quant_options.mode == turboquant::QuantizeMode::kTurboQuantQjl;
         const bool need_compressed_safe_error = !compress_b_none && opt.check_error;
         const bool need_global_b_metric = !compress_b_none && (opt.check_error || opt.check_b_error);
         const bool need_svd_vectors = !opt.skip_form_u || need_compressed_safe_error;
         const bool compress_subspace_none = subspace_quant_options.mode == turboquant::QuantizeMode::kNone;
         const bool compress_subspace_lloyd_tq =
-            subspace_quant_options.mode == turboquant::QuantizeMode::kTurboQuant;
+            subspace_quant_options.mode == turboquant::QuantizeMode::kTurboQuant ||
+            subspace_quant_options.mode == turboquant::QuantizeMode::kTurboQuantQjl;
         const bool compress_subspace_tq =
             subspace_quant_options.mode == turboquant::QuantizeMode::kTurboQuant ||
             subspace_quant_options.mode == turboquant::QuantizeMode::kTurboQuantQjl;
@@ -799,12 +812,12 @@ int main(int argc, char** argv) {
             turboquant::device_code_bytes(l, n, b_quant_options);
         const size_t z_code_bytes = compress_subspace_none ? 0 :
             turboquant::device_code_bytes(l, n, subspace_quant_options);
-        const size_t bi_qjl_sign_bytes = compress_b_qjl ?
-            static_cast<size_t>(b_quant_options.qjl_dim) * sizeof(int) : 0;
-        const size_t z_qjl_sign_bytes = compress_subspace_qjl ?
-            static_cast<size_t>(subspace_quant_options.qjl_dim) * sizeof(int) : 0;
-        const size_t bi_norm_bytes = compress_b_tq ? static_cast<size_t>(n) * sizeof(float) : 0;
-        const size_t z_norm_bytes = compress_subspace_lloyd_tq ? static_cast<size_t>(n) * sizeof(float) : 0;
+        const size_t bi_qjl_sign_bytes = turboquant::device_qjl_sign_bytes(l, n, b_quant_options);
+        const size_t z_qjl_sign_bytes = turboquant::device_qjl_sign_bytes(l, n, subspace_quant_options);
+        const size_t bi_norm_bytes = turboquant::device_norm_bytes(l, n, b_quant_options);
+        const size_t z_norm_bytes = turboquant::device_norm_bytes(l, n, subspace_quant_options);
+        const int bi_norm_count = checked_mpi_count(bi_norm_bytes / sizeof(float), "B norm payload count");
+        const int z_norm_count = checked_mpi_count(z_norm_bytes / sizeof(float), "subspace Z norm payload count");
         const size_t bi_payload_work_count = compress_b_none ? 0 :
             ((b_quant_options.mode == turboquant::QuantizeMode::kTurboQuant ||
               b_quant_options.mode == turboquant::QuantizeMode::kTurboQuantQjl) ?
@@ -843,19 +856,22 @@ int main(int argc, char** argv) {
         std::uint8_t* d_mpi_Z_codes_recv = nullptr;
         float* d_mpi_Z_norms = nullptr;
         float* d_mpi_Z_norms_recv = nullptr;
-        int* d_mpi_Z_qjl_signs = nullptr;
-        int* d_mpi_Z_qjl_signs_recv = nullptr;
+        std::uint8_t* d_mpi_Z_qjl_signs = nullptr;
+        std::uint8_t* d_mpi_Z_qjl_signs_recv = nullptr;
         std::uint8_t* d_mpi_B_codes = nullptr;
         std::uint8_t* d_mpi_B_codes_recv = nullptr;
         float* d_mpi_B_norms = nullptr;
         float* d_mpi_B_norms_recv = nullptr;
-        int* d_mpi_B_qjl_signs = nullptr;
-        int* d_mpi_B_qjl_signs_recv = nullptr;
+        std::uint8_t* d_mpi_B_qjl_signs = nullptr;
+        std::uint8_t* d_mpi_B_qjl_signs_recv = nullptr;
         float* d_mpi_B_tq_work = nullptr;
         std::vector<float*> d_Bi_reduce_on_gpu0(opt.ngpus, nullptr);
         std::vector<std::uint8_t*> d_Bi_codes_on_gpu0(opt.ngpus, nullptr);
         std::vector<float*> d_Bi_norms_on_gpu0(opt.ngpus, nullptr);
-        std::vector<int*> d_Bi_qjl_signs_on_gpu0(opt.ngpus, nullptr);
+        std::vector<std::uint8_t*> d_Bi_qjl_signs_on_gpu0(opt.ngpus, nullptr);
+        std::vector<std::uint8_t*> d_Z_codes_on_gpu0(opt.ngpus, nullptr);
+        std::vector<float*> d_Z_norms_on_gpu0(opt.ngpus, nullptr);
+        std::vector<std::uint8_t*> d_Z_qjl_signs_on_gpu0(opt.ngpus, nullptr);
         int lwork_r = 0;
         int lwork_z = 0;
         int lwork_svd = 0;
@@ -906,6 +922,15 @@ int main(int argc, char** argv) {
                 if (opt.subspace_iter > 0) {
                     CHECK_CUDA(cudaMalloc(&w.d_Zi, z_fp32_bytes));
                     CHECK_CUDA(cudaMalloc(&w.d_Z, z_fp32_bytes));
+                    if (compress_subspace_lloyd_tq) {
+                        CHECK_CUDA(cudaMalloc(&w.d_ZT, z_fp32_bytes));
+                        CHECK_CUDA(cudaMalloc(&w.d_Z_codes, z_code_bytes));
+                        CHECK_CUDA(cudaMalloc(&w.d_Z_norms, z_norm_bytes));
+                        if (compress_subspace_qjl) {
+                            CHECK_CUDA(cudaMalloc(&w.d_Z_qjl_signs, z_qjl_sign_bytes));
+                        }
+                        CHECK_CUDA(cudaMalloc(&w.d_Z_tq_work, z_row_tq_sign_count * sizeof(float)));
+                    }
                 }
                 CHECK_CUDA(cudaMalloc(&w.d_Bi, static_cast<size_t>(l) * n * sizeof(float)));
                 CHECK_CUDA(cudaMalloc(&w.d_Bi_hat, bi_fp32_bytes));
@@ -932,6 +957,13 @@ int main(int argc, char** argv) {
                     }
                     if (compress_b_qjl) {
                         CHECK_CUDA(cudaMalloc(&d_Bi_qjl_signs_on_gpu0[g], bi_qjl_sign_bytes));
+                    }
+                }
+                if (opt.subspace_iter > 0 && compress_subspace_lloyd_tq) {
+                    CHECK_CUDA(cudaMalloc(&d_Z_codes_on_gpu0[g], z_code_bytes));
+                    CHECK_CUDA(cudaMalloc(&d_Z_norms_on_gpu0[g], z_norm_bytes));
+                    if (compress_subspace_qjl) {
+                        CHECK_CUDA(cudaMalloc(&d_Z_qjl_signs_on_gpu0[g], z_qjl_sign_bytes));
                     }
                 }
             }
@@ -1062,34 +1094,32 @@ int main(int argc, char** argv) {
         double t_setup_gpu_resources_ms =
             t_create_gpu_handles_ms + t_allocate_gpu_buffers_ms + t_generate_test_matrix_ms;
 
-        std::vector<double> repeat_compute_ms;
-        std::vector<double> repeat_pipeline_ms;
+        std::vector<double> repeat_total_ms;
+        std::vector<double> repeat_gpu_compute_ms;
+        std::vector<double> repeat_host_staging_ms;
+        std::vector<double> repeat_nvlink_ms;
+        std::vector<double> repeat_infiniband_ms;
+        std::vector<double> repeat_other_sync_ms;
+        std::vector<double> repeat_host_gpu_payload_bytes;
+        std::vector<double> repeat_nvlink_payload_bytes;
+        std::vector<double> repeat_infiniband_payload_bytes;
         std::vector<double> repeat_b_relative_error;
         std::vector<double> repeat_global_b_relative_error;
         std::vector<double> repeat_final_error;
-        repeat_compute_ms.reserve(opt.repeat);
-        repeat_pipeline_ms.reserve(opt.repeat);
+        repeat_total_ms.reserve(opt.repeat);
+        repeat_gpu_compute_ms.reserve(opt.repeat);
+        repeat_host_staging_ms.reserve(opt.repeat);
+        repeat_nvlink_ms.reserve(opt.repeat);
+        repeat_infiniband_ms.reserve(opt.repeat);
+        repeat_other_sync_ms.reserve(opt.repeat);
+        repeat_host_gpu_payload_bytes.reserve(opt.repeat);
+        repeat_nvlink_payload_bytes.reserve(opt.repeat);
+        repeat_infiniband_payload_bytes.reserve(opt.repeat);
         repeat_b_relative_error.reserve(opt.repeat);
         repeat_global_b_relative_error.reserve(opt.repeat);
         repeat_final_error.reserve(opt.repeat);
-        constexpr int kStageCount = 8;
-        const std::array<const char*, kStageCount> stage_names = {
-            "Local Projection (Yi)",
-            "Local QR Yi",
-            "TSQR R Reduce (to GPU0)",
-            "Form Distributed Qi",
-            "Subspace Iteration",
-            "Build Reduce Bi",
-            "SVD B (on GPU0)",
-            "Form Distributed Ui",
-        };
-        std::array<std::vector<double>, kStageCount> repeat_stage_ms;
-        if (is_root) {
-            for (auto& samples : repeat_stage_ms) {
-                samples.reserve(opt.repeat);
-            }
-        }
         const bool vary_seed_per_repeat = opt.check_error || opt.check_b_error;
+        const bool report_timing_summary = !opt.check_error;
 
         for (int repeat_idx = 0; repeat_idx < opt.repeat; ++repeat_idx) {
         const unsigned repeat_seed = vary_seed_per_repeat ?
@@ -1103,45 +1133,104 @@ int main(int argc, char** argv) {
             std::cout << "\nRepeat " << (repeat_idx + 1) << "/" << opt.repeat << "\n";
         }
 
-        timer.tic();
         double current_A_norm2 = h_A_norm2;
+        double diagnostic_excluded_ms = 0.0;
+        double host_staging_time_ms = 0.0;
+        double nvlink_time_ms = 0.0;
+        double infiniband_time_ms = 0.0;
+        unsigned long long host_gpu_payload_bytes = 0;
+        unsigned long long nvlink_payload_bytes = 0;
+        unsigned long long infiniband_payload_bytes = 0;
+        std::vector<std::vector<float>> h_A_blocks_repeat;
+        std::vector<float> h_Omega_repeat;
+        const std::vector<std::vector<float>>* h_A_blocks_src = &h_A_blocks;
+        const std::vector<float>* h_Omega_src = &h_Omega;
+        if (!opt.device_random_input && vary_seed_per_repeat) {
+            if (!use_spectrum_decay) {
+                h_A_blocks_repeat = make_random_row_blocks(
+                    rows, n, repeat_seed, 1.0f / std::sqrt(static_cast<float>(m)), nullptr);
+                h_A_blocks_src = &h_A_blocks_repeat;
+            }
+            h_Omega_repeat = make_random_matrix(n, l, repeat_seed + 1, 1.0f);
+            h_Omega_src = &h_Omega_repeat;
+        }
+        if (opt.device_random_input && !use_spectrum_decay) {
+            NvtxRange range("generate_repeat_test_matrix_on_device");
+            for (int g = 0; g < opt.ngpus; ++g) {
+                DeviceWork& w = works[g];
+                CHECK_CUDA(cudaSetDevice(w.dev));
+                dim3 block(16, 16);
+                dim3 grid_a((w.mi + block.x - 1) / block.x, (n + block.y - 1) / block.y);
+                const float a_scale = std::sqrt(3.0f) / std::sqrt(static_cast<float>(m));
+                fill_random_colmajor_kernel<<<grid_a, block>>>(
+                    w.d_Ai, w.mi, n, w.row0, repeat_seed, a_scale);
+                CHECK_CUDA(cudaGetLastError());
+            }
+            for (int g = 0; g < opt.ngpus; ++g) {
+                CHECK_CUDA(cudaSetDevice(works[g].dev));
+                CHECK_CUDA(cudaDeviceSynchronize());
+            }
+        }
+        auto timed_mpi = [&](auto&& mpi_call, unsigned long long payload_bytes) {
+            // Inter-node / InfiniBand-like communication: count only the MPI collective call.
+            const double t0 = MPI_Wtime();
+            const int status = mpi_call();
+            const double t1 = MPI_Wtime();
+            CHECK_MPI(status);
+            infiniband_time_ms += (t1 - t0) * 1000.0;
+            infiniband_payload_bytes += payload_bytes;
+        };
+        auto mpi_bcast_payload = [&](size_t bytes) -> unsigned long long {
+            return is_root ?
+                static_cast<unsigned long long>(std::max(mpi.size - 1, 0)) *
+                    static_cast<unsigned long long>(bytes) :
+                0ULL;
+        };
+        auto timed_peer_copy = [&](void* dst, int dst_dev, const void* src, int src_dev, size_t bytes) {
+            // Intra-node / NVLink-like communication: count only GPU peer-copy traffic.
+            Timer peer_timer;
+            peer_timer.tic();
+            CHECK_CUDA(cudaMemcpyPeer(dst, dst_dev, src, src_dev, bytes));
+            nvlink_time_ms += peer_timer.toc_ms();
+            nvlink_payload_bytes += static_cast<unsigned long long>(bytes);
+        };
+        auto timed_host_copy = [&](void* dst, const void* src, size_t bytes, cudaMemcpyKind kind) {
+            // Host/Staging: node-local host<->GPU copies needed to bridge GPU kernels and MPI/CPU staging.
+            Timer host_copy_timer;
+            host_copy_timer.tic();
+            CHECK_CUDA(cudaMemcpy(dst, src, bytes, kind));
+            host_staging_time_ms += host_copy_timer.toc_ms();
+            if (kind == cudaMemcpyHostToDevice || kind == cudaMemcpyDeviceToHost) {
+                host_gpu_payload_bytes += static_cast<unsigned long long>(bytes);
+            }
+        };
+        auto timed_host_stage = [&](auto&& stage_work) {
+            // Host/Staging: CPU-side pack/unpack/accumulation used around MPI and host buffers.
+            Timer host_stage_timer;
+            host_stage_timer.tic();
+            stage_work();
+            host_staging_time_ms += host_stage_timer.toc_ms();
+        };
+
+        Timer total_timer;
+        total_timer.tic();
+        timer.tic();
         {
             NvtxRange range("local_projection_Yi");
-            std::vector<std::vector<float>> h_A_blocks_repeat;
-            std::vector<float> h_Omega_repeat;
-            const std::vector<std::vector<float>>* h_A_blocks_src = &h_A_blocks;
-            const std::vector<float>* h_Omega_src = &h_Omega;
-            if (!opt.device_random_input && vary_seed_per_repeat) {
-                if (!use_spectrum_decay) {
-                    h_A_blocks_repeat = make_random_row_blocks(
-                        rows, n, repeat_seed, 1.0f / std::sqrt(static_cast<float>(m)), nullptr);
-                    h_A_blocks_src = &h_A_blocks_repeat;
-                }
-                h_Omega_repeat = make_random_matrix(n, l, repeat_seed + 1, 1.0f);
-                h_Omega_src = &h_Omega_repeat;
-            }
             for (int g = 0; g < opt.ngpus; ++g) {
                 DeviceWork& w = works[g];
                 CHECK_CUDA(cudaSetDevice(w.dev));
                 if (opt.device_random_input) {
                     dim3 block(16, 16);
-                    if (!use_spectrum_decay) {
-                        dim3 grid_a((w.mi + block.x - 1) / block.x, (n + block.y - 1) / block.y);
-                        const float a_scale = std::sqrt(3.0f) / std::sqrt(static_cast<float>(m));
-                        fill_random_colmajor_kernel<<<grid_a, block>>>(
-                            w.d_Ai, w.mi, n, w.row0, repeat_seed, a_scale);
-                        CHECK_CUDA(cudaGetLastError());
-                    }
-
                     dim3 grid_omega((n + block.x - 1) / block.x, (l + block.y - 1) / block.y);
                     fill_random_colmajor_kernel<<<grid_omega, block>>>(
                         w.d_Omega, n, l, 0, repeat_seed + 1, std::sqrt(3.0f));
                     CHECK_CUDA(cudaGetLastError());
                 } else {
                     if (!use_spectrum_decay) {
-                        CHECK_CUDA(cudaMemcpy(w.d_Ai, (*h_A_blocks_src)[g].data(), static_cast<size_t>(w.mi) * n * sizeof(float), cudaMemcpyHostToDevice));
+                        timed_host_copy(w.d_Ai, (*h_A_blocks_src)[g].data(), static_cast<size_t>(w.mi) * n * sizeof(float), cudaMemcpyHostToDevice);
                     }
-                    CHECK_CUDA(cudaMemcpy(w.d_Omega, h_Omega_src->data(), static_cast<size_t>(n) * l * sizeof(float), cudaMemcpyHostToDevice));
+                    timed_host_copy(w.d_Omega, h_Omega_src->data(), static_cast<size_t>(n) * l * sizeof(float), cudaMemcpyHostToDevice);
                 }
 
                 const float alpha = 1.0f;
@@ -1160,6 +1249,8 @@ int main(int argc, char** argv) {
                 CHECK_CUDA(cudaDeviceSynchronize());
             }
             if (opt.check_error && !use_spectrum_decay) {
+                Timer diagnostic_timer;
+                diagnostic_timer.tic();
                 double local_A_norm2 = 0.0;
                 for (int g = 0; g < opt.ngpus; ++g) {
                     DeviceWork& w = works[g];
@@ -1185,6 +1276,7 @@ int main(int argc, char** argv) {
                 if (is_root) {
                     current_A_norm2 = global_A_norm2;
                 }
+                diagnostic_excluded_ms += diagnostic_timer.toc_ms();
             }
         }
         double t_local_projection_ms = timer.toc_ms();
@@ -1223,13 +1315,15 @@ int main(int argc, char** argv) {
                 DeviceWork& w = works[g];
                 CHECK_CUDA(cudaSetDevice(w.dev));
                 std::vector<float> h_Ri(static_cast<size_t>(l) * l);
-                CHECK_CUDA(cudaMemcpy(h_Ri.data(), w.d_Ri, static_cast<size_t>(l) * l * sizeof(float), cudaMemcpyDeviceToHost));
-                for (int col = 0; col < l; ++col) {
-                    for (int row = 0; row <= col; ++row) {
-                        h_Rstack_local[static_cast<size_t>(col) * local_r_rows + g * l + row] =
-                            h_Ri[static_cast<size_t>(col) * l + row];
+                timed_host_copy(h_Ri.data(), w.d_Ri, static_cast<size_t>(l) * l * sizeof(float), cudaMemcpyDeviceToHost);
+                timed_host_stage([&]() {
+                    for (int col = 0; col < l; ++col) {
+                        for (int row = 0; row <= col; ++row) {
+                            h_Rstack_local[static_cast<size_t>(col) * local_r_rows + g * l + row] =
+                                h_Ri[static_cast<size_t>(col) * l + row];
+                        }
                     }
-                }
+                });
                 r_payload_bytes += static_cast<size_t>(l) * l * sizeof(float);
             }
 
@@ -1253,32 +1347,38 @@ int main(int argc, char** argv) {
             NvtxRange range("tsqr_R_reduce_gpu0");
             CHECK_CUDA(cudaSetDevice(0));
 
-            CHECK_MPI(MPI_Gather(
-                h_Rstack_local.data(),
-                local_r_rows * l,
-                MPI_FLOAT,
-                is_root ? h_Rstack.data() : nullptr,
-                local_r_rows * l,
-                MPI_FLOAT,
-                0,
-                MPI_COMM_WORLD));
+            // Inter-node / InfiniBand-like TSQR metadata gather.
+            timed_mpi([&]() {
+                return MPI_Gather(
+                    h_Rstack_local.data(),
+                    local_r_rows * l,
+                    MPI_FLOAT,
+                    is_root ? h_Rstack.data() : nullptr,
+                    local_r_rows * l,
+                    MPI_FLOAT,
+                    0,
+                    MPI_COMM_WORLD);
+            }, static_cast<unsigned long long>(local_r_rows) * l * sizeof(float));
 
             if (is_root) {
-            CHECK_CUDA(cudaMemcpy(d_Rstack, h_Rstack.data(), static_cast<size_t>(r_rows) * l * sizeof(float), cudaMemcpyHostToDevice));
+                timed_host_copy(d_Rstack, h_Rstack.data(), static_cast<size_t>(r_rows) * l * sizeof(float), cudaMemcpyHostToDevice);
 
-            CHECK_CUSOLVER(cusolverDnSgeqrf(solver0, r_rows, l, d_Rstack, r_rows, d_tau_r, d_work_r, lwork_r, d_info0));
-            CHECK_CUDA(cudaDeviceSynchronize());
-            check_solver_info(d_info0, "TSQR geqrf");
-            CHECK_CUSOLVER(cusolverDnSorgqr(solver0, r_rows, l, l, d_Rstack, r_rows, d_tau_r, d_work_r, lwork_r, d_info0));
-            CHECK_CUDA(cudaDeviceSynchronize());
-            check_solver_info(d_info0, "TSQR orgqr");
+                CHECK_CUSOLVER(cusolverDnSgeqrf(solver0, r_rows, l, d_Rstack, r_rows, d_tau_r, d_work_r, lwork_r, d_info0));
+                CHECK_CUDA(cudaDeviceSynchronize());
+                check_solver_info(d_info0, "TSQR geqrf");
+                CHECK_CUSOLVER(cusolverDnSorgqr(solver0, r_rows, l, l, d_Rstack, r_rows, d_tau_r, d_work_r, lwork_r, d_info0));
+                CHECK_CUDA(cudaDeviceSynchronize());
+                check_solver_info(d_info0, "TSQR orgqr");
 
-            h_Tstack.resize(static_cast<size_t>(r_rows) * l);
-            CHECK_CUDA(cudaMemcpy(h_Tstack.data(), d_Rstack, static_cast<size_t>(r_rows) * l * sizeof(float), cudaMemcpyDeviceToHost));
+                h_Tstack.resize(static_cast<size_t>(r_rows) * l);
+                timed_host_copy(h_Tstack.data(), d_Rstack, static_cast<size_t>(r_rows) * l * sizeof(float), cudaMemcpyDeviceToHost);
             } else {
                 h_Tstack.resize(static_cast<size_t>(r_rows) * l);
             }
-            CHECK_MPI(MPI_Bcast(h_Tstack.data(), r_rows * l, MPI_FLOAT, 0, MPI_COMM_WORLD));
+            // Inter-node / InfiniBand-like TSQR correction broadcast.
+            timed_mpi([&]() {
+                return MPI_Bcast(h_Tstack.data(), r_rows * l, MPI_FLOAT, 0, MPI_COMM_WORLD);
+            }, mpi_bcast_payload(static_cast<size_t>(r_rows) * l * sizeof(float)));
         }
         double t_tsqr_reduce_ms = timer.toc_ms();
 
@@ -1289,13 +1389,15 @@ int main(int argc, char** argv) {
                 DeviceWork& w = works[g];
                 CHECK_CUDA(cudaSetDevice(w.dev));
                 std::vector<float> h_Ti(static_cast<size_t>(l) * l);
-                for (int col = 0; col < l; ++col) {
-                    const int global_g = mpi.rank * opt.ngpus + g;
-                    const float* src = h_Tstack.data() + static_cast<size_t>(col) * r_rows + global_g * l;
-                    float* dst = h_Ti.data() + static_cast<size_t>(col) * l;
-                    std::copy(src, src + l, dst);
-                }
-                CHECK_CUDA(cudaMemcpy(w.d_Ti, h_Ti.data(), static_cast<size_t>(l) * l * sizeof(float), cudaMemcpyHostToDevice));
+                timed_host_stage([&]() {
+                    for (int col = 0; col < l; ++col) {
+                        const int global_g = mpi.rank * opt.ngpus + g;
+                        const float* src = h_Tstack.data() + static_cast<size_t>(col) * r_rows + global_g * l;
+                        float* dst = h_Ti.data() + static_cast<size_t>(col) * l;
+                        std::copy(src, src + l, dst);
+                    }
+                });
+                timed_host_copy(w.d_Ti, h_Ti.data(), static_cast<size_t>(l) * l * sizeof(float), cudaMemcpyHostToDevice);
 
                 const float alpha = 1.0f;
                 const float beta = 0.0f;
@@ -1325,7 +1427,9 @@ int main(int argc, char** argv) {
             std::vector<float> h_Z_local(z_count);
             std::vector<float> h_Z_global(z_count);
             for (int iter = 0; iter < opt.subspace_iter; ++iter) {
-                std::fill(h_Z_local.begin(), h_Z_local.end(), 0.0f);
+                timed_host_stage([&]() {
+                    std::fill(h_Z_local.begin(), h_Z_local.end(), 0.0f);
+                });
 
                 for (int g = 0; g < opt.ngpus; ++g) {
                     DeviceWork& w = works[g];
@@ -1346,31 +1450,90 @@ int main(int argc, char** argv) {
                     CHECK_CUDA(cudaDeviceSynchronize());
                 }
 
-                for (int g = 0; g < opt.ngpus; ++g) {
-                    DeviceWork& w = works[g];
-                    std::vector<float> h_Zi(z_count);
-                    CHECK_CUDA(cudaSetDevice(w.dev));
-                    CHECK_CUDA(cudaMemcpy(h_Zi.data(), w.d_Zi, z_fp32_bytes, cudaMemcpyDeviceToHost));
-                    for (size_t i = 0; i < z_count; ++i) {
-                        h_Z_local[i] += h_Zi[i];
+                if (compress_subspace_lloyd_tq) {
+                    CHECK_CUDA(cudaSetDevice(0));
+                    CHECK_CUDA(cudaMemset(d_mpi_ZT_local, 0, z_fp32_bytes));
+                    for (int g = 0; g < opt.ngpus; ++g) {
+                        DeviceWork& w = works[g];
+                        CHECK_CUDA(cudaSetDevice(w.dev));
+                        {
+                            dim3 block(16, 16);
+                            dim3 grid((n + block.x - 1) / block.x, (l + block.y - 1) / block.y);
+                            transpose_colmajor_kernel<<<grid, block>>>(w.d_Zi, w.d_ZT, n, l);
+                            CHECK_CUDA(cudaGetLastError());
+                        }
+                        turboquant::DeviceCompressedBlock local_gpu_Z =
+                            turboquant::quantize_fp32_device_column_tq_to_device_payload(
+                                w.d_ZT,
+                                l,
+                                n,
+                                subspace_quant_options,
+                                w.d_Z_codes,
+                                w.d_Z_norms,
+                                w.d_Z_tq_work,
+                                nullptr,
+                                w.d_Z_qjl_signs);
+
+                        CHECK_CUDA(cudaSetDevice(0));
+                        turboquant::DeviceCompressedBlock local_gpu_Z_on_gpu0 = local_gpu_Z;
+                        if (w.dev != 0) {
+                            // Intra-node / NVLink-like compressed Z payload transfer.
+                            timed_peer_copy(d_Z_codes_on_gpu0[g], 0, w.d_Z_codes, w.dev, z_code_bytes);
+                            timed_peer_copy(d_Z_norms_on_gpu0[g], 0, w.d_Z_norms, w.dev, z_norm_bytes);
+                            local_gpu_Z_on_gpu0.d_codes = d_Z_codes_on_gpu0[g];
+                            local_gpu_Z_on_gpu0.d_norms = d_Z_norms_on_gpu0[g];
+                            local_gpu_Z_on_gpu0.d_residual_norms =
+                                compress_subspace_qjl ? d_Z_norms_on_gpu0[g] + n : nullptr;
+                            if (compress_subspace_qjl) {
+                                timed_peer_copy(d_Z_qjl_signs_on_gpu0[g], 0, w.d_Z_qjl_signs, w.dev, z_qjl_sign_bytes);
+                                local_gpu_Z_on_gpu0.d_qjl_signs = d_Z_qjl_signs_on_gpu0[g];
+                            }
+                        }
+                        turboquant::dequantize_column_tq_payload_add_to_fp32(
+                            local_gpu_Z_on_gpu0,
+                            d_mpi_ZT_local,
+                            d_mpi_Z_work);
+                    }
+                    {
+                        dim3 block(16, 16);
+                        dim3 grid((l + block.x - 1) / block.x, (n + block.y - 1) / block.y);
+                        transpose_colmajor_kernel<<<grid, block>>>(d_mpi_ZT_local, d_mpi_Z_local, l, n);
+                        CHECK_CUDA(cudaGetLastError());
+                    }
+                    CHECK_CUDA(cudaDeviceSynchronize());
+                    timed_host_copy(h_Z_local.data(), d_mpi_Z_local, z_fp32_bytes, cudaMemcpyDeviceToHost);
+                } else {
+                    for (int g = 0; g < opt.ngpus; ++g) {
+                        DeviceWork& w = works[g];
+                        std::vector<float> h_Zi(z_count);
+                        CHECK_CUDA(cudaSetDevice(w.dev));
+                        timed_host_copy(h_Zi.data(), w.d_Zi, z_fp32_bytes, cudaMemcpyDeviceToHost);
+                        timed_host_stage([&]() {
+                            for (size_t i = 0; i < z_count; ++i) {
+                                h_Z_local[i] += h_Zi[i];
+                            }
+                        });
                     }
                 }
 
                 z_fp32_payload_bytes += z_fp32_bytes;
                 if (compress_subspace_none) {
-                    CHECK_MPI(MPI_Allreduce(
-                        h_Z_local.data(),
-                        h_Z_global.data(),
-                        checked_mpi_count(z_count, "subspace Z MPI allreduce count"),
-                        MPI_FLOAT,
-                        MPI_SUM,
-                        MPI_COMM_WORLD));
+                    // Inter-node / InfiniBand-like raw Z allreduce.
+                    timed_mpi([&]() {
+                        return MPI_Allreduce(
+                            h_Z_local.data(),
+                            h_Z_global.data(),
+                            checked_mpi_count(z_count, "subspace Z MPI allreduce count"),
+                            MPI_FLOAT,
+                            MPI_SUM,
+                            MPI_COMM_WORLD);
+                    }, static_cast<unsigned long long>(z_fp32_bytes));
                     z_transmitted_payload_bytes += z_fp32_bytes;
                 } else {
                     Timer subspace_compress_timer;
                     subspace_compress_timer.tic();
                     CHECK_CUDA(cudaSetDevice(0));
-                    CHECK_CUDA(cudaMemcpy(d_mpi_Z_local, h_Z_local.data(), z_fp32_bytes, cudaMemcpyHostToDevice));
+                    timed_host_copy(d_mpi_Z_local, h_Z_local.data(), z_fp32_bytes, cudaMemcpyHostToDevice);
                     {
                         dim3 block(16, 16);
                         dim3 grid((n + block.x - 1) / block.x, (l + block.y - 1) / block.y);
@@ -1405,103 +1568,116 @@ int main(int argc, char** argv) {
 
                     std::vector<std::uint8_t> h_Z_codes(z_code_bytes);
                     std::vector<std::uint8_t> h_Z_codes_all(z_code_bytes * static_cast<size_t>(mpi.size));
-                    CHECK_CUDA(cudaMemcpy(h_Z_codes.data(), d_mpi_Z_codes, z_code_bytes, cudaMemcpyDeviceToHost));
-                    CHECK_MPI(MPI_Allgather(
-                        h_Z_codes.data(),
-                        checked_mpi_count(z_code_bytes, "compressed subspace Z code MPI allgather send count"),
-                        MPI_UNSIGNED_CHAR,
-                        h_Z_codes_all.data(),
-                        checked_mpi_count(z_code_bytes, "compressed subspace Z code MPI allgather receive count"),
-                        MPI_UNSIGNED_CHAR,
-                        MPI_COMM_WORLD));
+                    timed_host_copy(h_Z_codes.data(), d_mpi_Z_codes, z_code_bytes, cudaMemcpyDeviceToHost);
+                    // Inter-node / InfiniBand-like compressed Z code allgather.
+                    timed_mpi([&]() {
+                        return MPI_Allgather(
+                            h_Z_codes.data(),
+                            checked_mpi_count(z_code_bytes, "compressed subspace Z code MPI allgather send count"),
+                            MPI_UNSIGNED_CHAR,
+                            h_Z_codes_all.data(),
+                            checked_mpi_count(z_code_bytes, "compressed subspace Z code MPI allgather receive count"),
+                            MPI_UNSIGNED_CHAR,
+                            MPI_COMM_WORLD);
+                    }, static_cast<unsigned long long>(z_code_bytes));
 
                     std::vector<float> h_Z_norms;
                     std::vector<float> h_Z_norms_all;
                     if (compress_subspace_lloyd_tq) {
-                        h_Z_norms.resize(static_cast<size_t>(n));
-                        h_Z_norms_all.resize(static_cast<size_t>(n) * mpi.size);
-                        CHECK_CUDA(cudaMemcpy(
+                        h_Z_norms.resize(static_cast<size_t>(z_norm_count));
+                        h_Z_norms_all.resize(static_cast<size_t>(z_norm_count) * mpi.size);
+                        timed_host_copy(
                             h_Z_norms.data(),
                             d_mpi_Z_norms,
                             z_norm_bytes,
-                            cudaMemcpyDeviceToHost));
-                        CHECK_MPI(MPI_Allgather(
-                            h_Z_norms.data(),
-                            n,
-                            MPI_FLOAT,
-                            h_Z_norms_all.data(),
-                            n,
-                            MPI_FLOAT,
-                            MPI_COMM_WORLD));
+                            cudaMemcpyDeviceToHost);
+                        // Inter-node / InfiniBand-like compressed Z norm allgather.
+                        timed_mpi([&]() {
+                            return MPI_Allgather(
+                                h_Z_norms.data(),
+                                z_norm_count,
+                                MPI_FLOAT,
+                                h_Z_norms_all.data(),
+                                z_norm_count,
+                                MPI_FLOAT,
+                                MPI_COMM_WORLD);
+                        }, static_cast<unsigned long long>(z_norm_bytes));
                     }
 
-                    std::vector<int> h_Z_qjl_signs;
-                    std::vector<int> h_Z_qjl_signs_all;
+                    std::vector<std::uint8_t> h_Z_qjl_signs;
+                    std::vector<std::uint8_t> h_Z_qjl_signs_all;
                     if (compress_subspace_qjl) {
-                        h_Z_qjl_signs.resize(static_cast<size_t>(subspace_quant_options.qjl_dim));
-                        h_Z_qjl_signs_all.resize(static_cast<size_t>(subspace_quant_options.qjl_dim) * mpi.size);
-                        CHECK_CUDA(cudaMemcpy(
+                        h_Z_qjl_signs.resize(z_qjl_sign_bytes);
+                        h_Z_qjl_signs_all.resize(z_qjl_sign_bytes * static_cast<size_t>(mpi.size));
+                        timed_host_copy(
                             h_Z_qjl_signs.data(),
                             d_mpi_Z_qjl_signs,
                             z_qjl_sign_bytes,
-                            cudaMemcpyDeviceToHost));
-                        CHECK_MPI(MPI_Allgather(
-                            h_Z_qjl_signs.data(),
-                            subspace_quant_options.qjl_dim,
-                            MPI_INT,
-                            h_Z_qjl_signs_all.data(),
-                            subspace_quant_options.qjl_dim,
-                            MPI_INT,
-                            MPI_COMM_WORLD));
+                            cudaMemcpyDeviceToHost);
+                        timed_mpi([&]() {
+                            return MPI_Allgather(
+                                h_Z_qjl_signs.data(),
+                                checked_mpi_count(z_qjl_sign_bytes, "compressed subspace Z QJL sign MPI allgather send count"),
+                                MPI_UNSIGNED_CHAR,
+                                h_Z_qjl_signs_all.data(),
+                                checked_mpi_count(z_qjl_sign_bytes, "compressed subspace Z QJL sign MPI allgather receive count"),
+                                MPI_UNSIGNED_CHAR,
+                                MPI_COMM_WORLD);
+                        }, static_cast<unsigned long long>(z_qjl_sign_bytes));
                     }
 
                     const float local_Z_scale = local_Z_compressed.scale;
                     const float local_Z_residual_norm = local_Z_compressed.residual_norm;
                     std::vector<float> h_Z_scales(mpi.size);
                     std::vector<float> h_Z_residual_norms(mpi.size);
-                    CHECK_MPI(MPI_Allgather(
-                        &local_Z_scale,
-                        1,
-                        MPI_FLOAT,
-                        h_Z_scales.data(),
-                        1,
-                        MPI_FLOAT,
-                        MPI_COMM_WORLD));
-                    CHECK_MPI(MPI_Allgather(
-                        &local_Z_residual_norm,
-                        1,
-                        MPI_FLOAT,
-                        h_Z_residual_norms.data(),
-                        1,
-                        MPI_FLOAT,
-                        MPI_COMM_WORLD));
+                    timed_mpi([&]() {
+                        return MPI_Allgather(
+                            &local_Z_scale,
+                            1,
+                            MPI_FLOAT,
+                            h_Z_scales.data(),
+                            1,
+                            MPI_FLOAT,
+                            MPI_COMM_WORLD);
+                    }, static_cast<unsigned long long>(sizeof(float)));
+                    timed_mpi([&]() {
+                        return MPI_Allgather(
+                            &local_Z_residual_norm,
+                            1,
+                            MPI_FLOAT,
+                            h_Z_residual_norms.data(),
+                            1,
+                            MPI_FLOAT,
+                            MPI_COMM_WORLD);
+                    }, static_cast<unsigned long long>(sizeof(float)));
 
                     CHECK_CUDA(cudaSetDevice(0));
                     CHECK_CUDA(cudaMemset(d_mpi_ZT_global, 0, z_fp32_bytes));
                     for (int r = 0; r < mpi.size; ++r) {
-                        CHECK_CUDA(cudaMemcpy(
+                        timed_host_copy(
                             d_mpi_Z_codes_recv,
                             h_Z_codes_all.data() + static_cast<size_t>(r) * z_code_bytes,
                             z_code_bytes,
-                            cudaMemcpyHostToDevice));
+                            cudaMemcpyHostToDevice);
                         turboquant::DeviceCompressedBlock rank_Z = local_Z_compressed;
                         rank_Z.d_codes = d_mpi_Z_codes_recv;
                         rank_Z.scale = h_Z_scales[r];
                         rank_Z.residual_norm = h_Z_residual_norms[r];
                         if (compress_subspace_lloyd_tq) {
-                            CHECK_CUDA(cudaMemcpy(
+                            timed_host_copy(
                                 d_mpi_Z_norms_recv,
-                                h_Z_norms_all.data() + static_cast<size_t>(r) * n,
+                                h_Z_norms_all.data() + static_cast<size_t>(r) * z_norm_count,
                                 z_norm_bytes,
-                                cudaMemcpyHostToDevice));
+                                cudaMemcpyHostToDevice);
                             rank_Z.d_norms = d_mpi_Z_norms_recv;
+                            rank_Z.d_residual_norms = compress_subspace_qjl ? d_mpi_Z_norms_recv + n : nullptr;
                         }
                         if (compress_subspace_qjl) {
-                            CHECK_CUDA(cudaMemcpy(
+                            timed_host_copy(
                                 d_mpi_Z_qjl_signs_recv,
-                                h_Z_qjl_signs_all.data() + static_cast<size_t>(r) * subspace_quant_options.qjl_dim,
+                                h_Z_qjl_signs_all.data() + static_cast<size_t>(r) * z_qjl_sign_bytes,
                                 z_qjl_sign_bytes,
-                                cudaMemcpyHostToDevice));
+                                cudaMemcpyHostToDevice);
                             rank_Z.d_qjl_signs = d_mpi_Z_qjl_signs_recv;
                         }
                         if (compress_subspace_tq) {
@@ -1526,13 +1702,13 @@ int main(int argc, char** argv) {
                         CHECK_CUDA(cudaGetLastError());
                     }
                     CHECK_CUDA(cudaDeviceSynchronize());
-                    CHECK_CUDA(cudaMemcpy(h_Z_global.data(), d_mpi_Z_global, z_fp32_bytes, cudaMemcpyDeviceToHost));
+                    timed_host_copy(h_Z_global.data(), d_mpi_Z_global, z_fp32_bytes, cudaMemcpyDeviceToHost);
                 }
 
                 if (opt.stabilize_subspace_z) {
                     NvtxRange z_qr_range("orthogonalize_subspace_Z");
                     CHECK_CUDA(cudaSetDevice(0));
-                    CHECK_CUDA(cudaMemcpy(d_Z_qr, h_Z_global.data(), z_fp32_bytes, cudaMemcpyHostToDevice));
+                    timed_host_copy(d_Z_qr, h_Z_global.data(), z_fp32_bytes, cudaMemcpyHostToDevice);
                     CHECK_CUSOLVER(cusolverDnSgeqrf(
                         solver0, n, l, d_Z_qr, n, d_tau_z, d_work_z, lwork_z, d_info0));
                     CHECK_CUDA(cudaDeviceSynchronize());
@@ -1541,13 +1717,13 @@ int main(int argc, char** argv) {
                         solver0, n, l, l, d_Z_qr, n, d_tau_z, d_work_z, lwork_z, d_info0));
                     CHECK_CUDA(cudaDeviceSynchronize());
                     check_solver_info(d_info0, "subspace Z orgqr");
-                    CHECK_CUDA(cudaMemcpy(h_Z_global.data(), d_Z_qr, z_fp32_bytes, cudaMemcpyDeviceToHost));
+                    timed_host_copy(h_Z_global.data(), d_Z_qr, z_fp32_bytes, cudaMemcpyDeviceToHost);
                 }
 
                 for (int g = 0; g < opt.ngpus; ++g) {
                     DeviceWork& w = works[g];
                     CHECK_CUDA(cudaSetDevice(w.dev));
-                    CHECK_CUDA(cudaMemcpy(w.d_Z, h_Z_global.data(), z_fp32_bytes, cudaMemcpyHostToDevice));
+                    timed_host_copy(w.d_Z, h_Z_global.data(), z_fp32_bytes, cudaMemcpyHostToDevice);
                     const float alpha = 1.0f;
                     const float beta = 0.0f;
                     CHECK_CUBLAS(cublasSgemm(
@@ -1564,11 +1740,13 @@ int main(int argc, char** argv) {
                     CHECK_CUDA(cudaDeviceSynchronize());
                 }
 
-                std::fill(h_Rstack_local.begin(), h_Rstack_local.end(), 0.0f);
-                if (is_root) {
-                    std::fill(h_Rstack.begin(), h_Rstack.end(), 0.0f);
-                }
-                h_Tstack.clear();
+                timed_host_stage([&]() {
+                    std::fill(h_Rstack_local.begin(), h_Rstack_local.end(), 0.0f);
+                    if (is_root) {
+                        std::fill(h_Rstack.begin(), h_Rstack.end(), 0.0f);
+                    }
+                    h_Tstack.clear();
+                });
 
                 for (int g = 0; g < opt.ngpus; ++g) {
                     DeviceWork& w = works[g];
@@ -1594,13 +1772,15 @@ int main(int argc, char** argv) {
                     DeviceWork& w = works[g];
                     CHECK_CUDA(cudaSetDevice(w.dev));
                     std::vector<float> h_Ri(static_cast<size_t>(l) * l);
-                    CHECK_CUDA(cudaMemcpy(h_Ri.data(), w.d_Ri, static_cast<size_t>(l) * l * sizeof(float), cudaMemcpyDeviceToHost));
-                    for (int col = 0; col < l; ++col) {
-                        for (int row = 0; row <= col; ++row) {
-                            h_Rstack_local[static_cast<size_t>(col) * local_r_rows + g * l + row] =
-                                h_Ri[static_cast<size_t>(col) * l + row];
+                    timed_host_copy(h_Ri.data(), w.d_Ri, static_cast<size_t>(l) * l * sizeof(float), cudaMemcpyDeviceToHost);
+                    timed_host_stage([&]() {
+                        for (int col = 0; col < l; ++col) {
+                            for (int row = 0; row <= col; ++row) {
+                                h_Rstack_local[static_cast<size_t>(col) * local_r_rows + g * l + row] =
+                                    h_Ri[static_cast<size_t>(col) * l + row];
+                            }
                         }
-                    }
+                    });
                     r_payload_bytes += static_cast<size_t>(l) * l * sizeof(float);
                 }
 
@@ -1617,18 +1797,21 @@ int main(int argc, char** argv) {
                 }
 
                 CHECK_CUDA(cudaSetDevice(0));
-                CHECK_MPI(MPI_Gather(
-                    h_Rstack_local.data(),
-                    local_r_rows * l,
-                    MPI_FLOAT,
-                    is_root ? h_Rstack.data() : nullptr,
-                    local_r_rows * l,
-                    MPI_FLOAT,
-                    0,
-                    MPI_COMM_WORLD));
+                // Inter-node / InfiniBand-like TSQR metadata gather inside subspace iteration.
+                timed_mpi([&]() {
+                    return MPI_Gather(
+                        h_Rstack_local.data(),
+                        local_r_rows * l,
+                        MPI_FLOAT,
+                        is_root ? h_Rstack.data() : nullptr,
+                        local_r_rows * l,
+                        MPI_FLOAT,
+                        0,
+                        MPI_COMM_WORLD);
+                }, static_cast<unsigned long long>(local_r_rows) * l * sizeof(float));
 
                 if (is_root) {
-                    CHECK_CUDA(cudaMemcpy(d_Rstack, h_Rstack.data(), static_cast<size_t>(r_rows) * l * sizeof(float), cudaMemcpyHostToDevice));
+                    timed_host_copy(d_Rstack, h_Rstack.data(), static_cast<size_t>(r_rows) * l * sizeof(float), cudaMemcpyHostToDevice);
                     CHECK_CUSOLVER(cusolverDnSgeqrf(solver0, r_rows, l, d_Rstack, r_rows, d_tau_r, d_work_r, lwork_r, d_info0));
                     CHECK_CUDA(cudaDeviceSynchronize());
                     check_solver_info(d_info0, "subspace TSQR geqrf");
@@ -1637,23 +1820,28 @@ int main(int argc, char** argv) {
                     check_solver_info(d_info0, "subspace TSQR orgqr");
 
                     h_Tstack.resize(static_cast<size_t>(r_rows) * l);
-                    CHECK_CUDA(cudaMemcpy(h_Tstack.data(), d_Rstack, static_cast<size_t>(r_rows) * l * sizeof(float), cudaMemcpyDeviceToHost));
+                    timed_host_copy(h_Tstack.data(), d_Rstack, static_cast<size_t>(r_rows) * l * sizeof(float), cudaMemcpyDeviceToHost);
                 } else {
                     h_Tstack.resize(static_cast<size_t>(r_rows) * l);
                 }
-                CHECK_MPI(MPI_Bcast(h_Tstack.data(), r_rows * l, MPI_FLOAT, 0, MPI_COMM_WORLD));
+                // Inter-node / InfiniBand-like TSQR correction broadcast inside subspace iteration.
+                timed_mpi([&]() {
+                    return MPI_Bcast(h_Tstack.data(), r_rows * l, MPI_FLOAT, 0, MPI_COMM_WORLD);
+                }, mpi_bcast_payload(static_cast<size_t>(r_rows) * l * sizeof(float)));
 
                 for (int g = 0; g < opt.ngpus; ++g) {
                     DeviceWork& w = works[g];
                     CHECK_CUDA(cudaSetDevice(w.dev));
                     std::vector<float> h_Ti(static_cast<size_t>(l) * l);
-                    for (int col = 0; col < l; ++col) {
-                        const int global_g = mpi.rank * opt.ngpus + g;
-                        const float* src = h_Tstack.data() + static_cast<size_t>(col) * r_rows + global_g * l;
-                        float* dst = h_Ti.data() + static_cast<size_t>(col) * l;
-                        std::copy(src, src + l, dst);
-                    }
-                    CHECK_CUDA(cudaMemcpy(w.d_Ti, h_Ti.data(), static_cast<size_t>(l) * l * sizeof(float), cudaMemcpyHostToDevice));
+                    timed_host_stage([&]() {
+                        for (int col = 0; col < l; ++col) {
+                            const int global_g = mpi.rank * opt.ngpus + g;
+                            const float* src = h_Tstack.data() + static_cast<size_t>(col) * r_rows + global_g * l;
+                            float* dst = h_Ti.data() + static_cast<size_t>(col) * l;
+                            std::copy(src, src + l, dst);
+                        }
+                    });
+                    timed_host_copy(w.d_Ti, h_Ti.data(), static_cast<size_t>(l) * l * sizeof(float), cudaMemcpyHostToDevice);
 
                     const float alpha = 1.0f;
                     const float beta = 0.0f;
@@ -1683,8 +1871,6 @@ int main(int argc, char** argv) {
 
         size_t b_fp32_payload_bytes = 0;
         size_t b_transmitted_payload_bytes = 0;
-        size_t mpi_b_fp32_payload_bytes = 0;
-        size_t mpi_b_transmitted_payload_bytes = 0;
         double t_compress_b_ms = 0.0;
         long double b_error_norm2 = 0.0L;
         long double b_ref_norm2 = 0.0L;
@@ -1715,10 +1901,15 @@ int main(int argc, char** argv) {
                 b_fp32_payload_bytes += bi_fp32_bytes;
                 std::vector<float> h_Bi_ref;
                 if (opt.check_b_error) {
+                    Timer diagnostic_timer;
+                    diagnostic_timer.tic();
                     h_Bi_ref.resize(b_count);
                     CHECK_CUDA(cudaMemcpy(h_Bi_ref.data(), w.d_Bi, bi_fp32_bytes, cudaMemcpyDeviceToHost));
+                    diagnostic_excluded_ms += diagnostic_timer.toc_ms();
                 }
                 if (need_global_b_metric) {
+                    Timer diagnostic_timer;
+                    diagnostic_timer.tic();
                     CHECK_CUDA(cudaSetDevice(0));
                     float* d_Bi_exact_on_gpu0 = w.d_Bi;
                     if (w.dev != 0) {
@@ -1732,10 +1923,12 @@ int main(int argc, char** argv) {
                     CHECK_CUDA(cudaGetLastError());
                     CHECK_CUDA(cudaDeviceSynchronize());
                     CHECK_CUDA(cudaSetDevice(w.dev));
+                    diagnostic_excluded_ms += diagnostic_timer.toc_ms();
                 }
 
                 float* d_reconstructed_Bi = w.d_Bi_hat;
-                bool decoded_payload_on_gpu0 = false;
+                bool payload_on_gpu0 = (w.dev == 0);
+                bool accumulated_to_B = false;
                 Timer compress_timer;
                 compress_timer.tic();
                 size_t compressed_payload_bytes = bi_fp32_bytes;
@@ -1774,21 +1967,24 @@ int main(int argc, char** argv) {
                     turboquant::DeviceCompressedBlock compressed_on_gpu0 = compressed;
                     float* d_payload_decode_output = w.d_Bi_hat;
                     if (w.dev != 0) {
-                        CHECK_CUDA(cudaMemcpyPeer(
-                            d_Bi_codes_on_gpu0[g], 0, w.d_Bi_codes, w.dev, bi_code_bytes));
+                        // Intra-node / NVLink-like compressed B payload transfer.
+                        timed_peer_copy(d_Bi_codes_on_gpu0[g], 0, w.d_Bi_codes, w.dev, bi_code_bytes);
                         compressed_on_gpu0.d_codes = d_Bi_codes_on_gpu0[g];
                         d_payload_decode_output = d_Bi_reduce_on_gpu0[g];
-                        decoded_payload_on_gpu0 = true;
+                        payload_on_gpu0 = true;
                         if (compress_b_tq) {
-                            CHECK_CUDA(cudaMemcpyPeer(
-                                d_Bi_norms_on_gpu0[g], 0, w.d_Bi_norms, w.dev, bi_norm_bytes));
+                            timed_peer_copy(d_Bi_norms_on_gpu0[g], 0, w.d_Bi_norms, w.dev, bi_norm_bytes);
                             compressed_on_gpu0.d_norms = d_Bi_norms_on_gpu0[g];
+                            compressed_on_gpu0.d_residual_norms =
+                                compress_b_qjl ? d_Bi_norms_on_gpu0[g] + n : nullptr;
                         }
                         if (compress_b_qjl) {
-                            CHECK_CUDA(cudaMemcpyPeer(
-                                d_Bi_qjl_signs_on_gpu0[g], 0, w.d_Bi_qjl_signs, w.dev, bi_qjl_sign_bytes));
+                            timed_peer_copy(d_Bi_qjl_signs_on_gpu0[g], 0, w.d_Bi_qjl_signs, w.dev, bi_qjl_sign_bytes);
                             compressed_on_gpu0.d_qjl_signs = d_Bi_qjl_signs_on_gpu0[g];
                         }
+                    }
+                    if (!payload_on_gpu0) {
+                        throw std::runtime_error("Compressed B payload must be resident on GPU0 before decode.");
                     }
                     {
                         NvtxRange decode_range("decode_Bi_payload_gpu0");
@@ -1805,7 +2001,7 @@ int main(int argc, char** argv) {
                                     compressed_on_gpu0,
                                     d_B,
                                     d_payload_decode_work);
-                                decoded_payload_on_gpu0 = true;
+                                accumulated_to_B = true;
                                 d_payload_decode_output = d_B;
                             }
                         } else {
@@ -1821,6 +2017,8 @@ int main(int argc, char** argv) {
                 b_transmitted_payload_bytes += compressed_payload_bytes;
 
                 if (opt.check_b_error) {
+                    Timer diagnostic_timer;
+                    diagnostic_timer.tic();
                     std::vector<float> h_Bi_hat(b_count);
                     CHECK_CUDA(cudaMemcpy(h_Bi_hat.data(), d_reconstructed_Bi, bi_fp32_bytes, cudaMemcpyDeviceToHost));
                     for (size_t i = 0; i < b_count; ++i) {
@@ -1829,22 +2027,24 @@ int main(int argc, char** argv) {
                         b_error_norm2 += diff * diff;
                         b_ref_norm2 += ref * ref;
                     }
+                    diagnostic_excluded_ms += diagnostic_timer.toc_ms();
                 }
 
-                if (decoded_payload_on_gpu0) {
+                if (accumulated_to_B) {
                     continue;
                 }
 
                 CHECK_CUDA(cudaSetDevice(0));
                 float* d_Bi_hat_on_gpu0 = compress_b_none ? w.d_Bi : d_reconstructed_Bi;
-                if (w.dev != 0 && !decoded_payload_on_gpu0) {
+                if (w.dev != 0 && compress_b_none) {
                     d_Bi_hat_on_gpu0 = d_Bi_reduce_on_gpu0[g];
-                    CHECK_CUDA(cudaMemcpyPeer(
+                    // Intra-node / NVLink-like raw B_i transfer to rank-local GPU0.
+                    timed_peer_copy(
                         d_Bi_hat_on_gpu0,
                         0,
                         compress_b_none ? w.d_Bi : d_reconstructed_Bi,
                         w.dev,
-                        bi_fp32_bytes));
+                        bi_fp32_bytes);
                 }
                 const int threads = 256;
                 const int blocks = static_cast<int>((b_count + threads - 1) / threads);
@@ -1853,26 +2053,27 @@ int main(int argc, char** argv) {
                 CHECK_CUDA(cudaDeviceSynchronize());
             }
 
-            mpi_b_fp32_payload_bytes = bi_fp32_bytes;
             if (compress_b_none) {
-                mpi_b_transmitted_payload_bytes = bi_fp32_bytes;
                 std::vector<float> h_B_local(b_count);
                 std::vector<float> h_B_global;
                 if (is_root) {
                     h_B_global.resize(b_count);
                 }
                 CHECK_CUDA(cudaSetDevice(0));
-                CHECK_CUDA(cudaMemcpy(h_B_local.data(), d_B, bi_fp32_bytes, cudaMemcpyDeviceToHost));
-                CHECK_MPI(MPI_Reduce(
-                    h_B_local.data(),
-                    is_root ? h_B_global.data() : nullptr,
-                    checked_mpi_count(b_count, "B FP32 MPI reduce count"),
-                    MPI_FLOAT,
-                    MPI_SUM,
-                    0,
-                    MPI_COMM_WORLD));
+                timed_host_copy(h_B_local.data(), d_B, bi_fp32_bytes, cudaMemcpyDeviceToHost);
+                // Inter-node / InfiniBand-like raw B reduce.
+                timed_mpi([&]() {
+                    return MPI_Reduce(
+                        h_B_local.data(),
+                        is_root ? h_B_global.data() : nullptr,
+                        checked_mpi_count(b_count, "B FP32 MPI reduce count"),
+                        MPI_FLOAT,
+                        MPI_SUM,
+                        0,
+                        MPI_COMM_WORLD);
+                }, static_cast<unsigned long long>(bi_fp32_bytes));
                 if (is_root) {
-                    CHECK_CUDA(cudaMemcpy(d_B, h_B_global.data(), bi_fp32_bytes, cudaMemcpyHostToDevice));
+                    timed_host_copy(d_B, h_B_global.data(), bi_fp32_bytes, cudaMemcpyHostToDevice);
                 }
             } else {
                 Timer mpi_compress_timer;
@@ -1904,65 +2105,73 @@ int main(int argc, char** argv) {
                 t_compress_b_ms += mpi_compress_timer.toc_ms();
 
                 std::vector<std::uint8_t> h_mpi_B_codes(bi_code_bytes);
-                CHECK_CUDA(cudaMemcpy(h_mpi_B_codes.data(), d_mpi_B_codes, bi_code_bytes, cudaMemcpyDeviceToHost));
+                timed_host_copy(h_mpi_B_codes.data(), d_mpi_B_codes, bi_code_bytes, cudaMemcpyDeviceToHost);
                 std::vector<std::uint8_t> h_mpi_B_codes_all;
                 if (is_root) {
                     h_mpi_B_codes_all.resize(bi_code_bytes * static_cast<size_t>(mpi.size));
                 }
-                CHECK_MPI(MPI_Gather(
-                    h_mpi_B_codes.data(),
-                    checked_mpi_count(bi_code_bytes, "compressed B code MPI gather count"),
-                    MPI_UNSIGNED_CHAR,
-                    is_root ? h_mpi_B_codes_all.data() : nullptr,
-                    checked_mpi_count(bi_code_bytes, "compressed B code MPI receive count"),
-                    MPI_UNSIGNED_CHAR,
-                    0,
-                    MPI_COMM_WORLD));
+                // Inter-node / InfiniBand-like compressed B code gather.
+                timed_mpi([&]() {
+                    return MPI_Gather(
+                        h_mpi_B_codes.data(),
+                        checked_mpi_count(bi_code_bytes, "compressed B code MPI gather count"),
+                        MPI_UNSIGNED_CHAR,
+                        is_root ? h_mpi_B_codes_all.data() : nullptr,
+                        checked_mpi_count(bi_code_bytes, "compressed B code MPI receive count"),
+                        MPI_UNSIGNED_CHAR,
+                        0,
+                        MPI_COMM_WORLD);
+                }, static_cast<unsigned long long>(bi_code_bytes));
 
                 std::vector<float> h_mpi_B_norms;
                 std::vector<float> h_mpi_B_norms_all;
                 if (compress_b_tq) {
-                    h_mpi_B_norms.resize(static_cast<size_t>(n));
-                    CHECK_CUDA(cudaMemcpy(
+                    h_mpi_B_norms.resize(static_cast<size_t>(bi_norm_count));
+                    timed_host_copy(
                         h_mpi_B_norms.data(),
                         d_mpi_B_norms,
                         bi_norm_bytes,
-                        cudaMemcpyDeviceToHost));
+                        cudaMemcpyDeviceToHost);
                     if (is_root) {
-                        h_mpi_B_norms_all.resize(static_cast<size_t>(n) * mpi.size);
+                        h_mpi_B_norms_all.resize(static_cast<size_t>(bi_norm_count) * mpi.size);
                     }
-                    CHECK_MPI(MPI_Gather(
-                        h_mpi_B_norms.data(),
-                        n,
-                        MPI_FLOAT,
-                        is_root ? h_mpi_B_norms_all.data() : nullptr,
-                        n,
-                        MPI_FLOAT,
-                        0,
-                        MPI_COMM_WORLD));
+                    // Inter-node / InfiniBand-like compressed B norm gather.
+                    timed_mpi([&]() {
+                        return MPI_Gather(
+                            h_mpi_B_norms.data(),
+                            bi_norm_count,
+                            MPI_FLOAT,
+                            is_root ? h_mpi_B_norms_all.data() : nullptr,
+                            bi_norm_count,
+                            MPI_FLOAT,
+                            0,
+                            MPI_COMM_WORLD);
+                    }, static_cast<unsigned long long>(bi_norm_bytes));
                 }
 
-                std::vector<int> h_mpi_B_qjl_signs;
-                std::vector<int> h_mpi_B_qjl_signs_all;
+                std::vector<std::uint8_t> h_mpi_B_qjl_signs;
+                std::vector<std::uint8_t> h_mpi_B_qjl_signs_all;
                 if (compress_b_qjl) {
-                    h_mpi_B_qjl_signs.resize(static_cast<size_t>(b_quant_options.qjl_dim));
-                    CHECK_CUDA(cudaMemcpy(
+                    h_mpi_B_qjl_signs.resize(bi_qjl_sign_bytes);
+                    timed_host_copy(
                         h_mpi_B_qjl_signs.data(),
                         d_mpi_B_qjl_signs,
                         bi_qjl_sign_bytes,
-                        cudaMemcpyDeviceToHost));
+                        cudaMemcpyDeviceToHost);
                     if (is_root) {
-                        h_mpi_B_qjl_signs_all.resize(static_cast<size_t>(b_quant_options.qjl_dim) * mpi.size);
+                        h_mpi_B_qjl_signs_all.resize(bi_qjl_sign_bytes * static_cast<size_t>(mpi.size));
                     }
-                    CHECK_MPI(MPI_Gather(
-                        h_mpi_B_qjl_signs.data(),
-                        b_quant_options.qjl_dim,
-                        MPI_INT,
-                        is_root ? h_mpi_B_qjl_signs_all.data() : nullptr,
-                        b_quant_options.qjl_dim,
-                        MPI_INT,
-                        0,
-                        MPI_COMM_WORLD));
+                    timed_mpi([&]() {
+                        return MPI_Gather(
+                            h_mpi_B_qjl_signs.data(),
+                            checked_mpi_count(bi_qjl_sign_bytes, "compressed B QJL sign MPI gather send count"),
+                            MPI_UNSIGNED_CHAR,
+                            is_root ? h_mpi_B_qjl_signs_all.data() : nullptr,
+                            checked_mpi_count(bi_qjl_sign_bytes, "compressed B QJL sign MPI receive count"),
+                            MPI_UNSIGNED_CHAR,
+                            0,
+                            MPI_COMM_WORLD);
+                    }, static_cast<unsigned long long>(bi_qjl_sign_bytes));
                 }
 
                 const float local_mpi_B_scale = mpi_B_compressed.scale;
@@ -1973,53 +2182,57 @@ int main(int argc, char** argv) {
                     h_mpi_B_scales.resize(mpi.size);
                     h_mpi_B_residual_norms.resize(mpi.size);
                 }
-                CHECK_MPI(MPI_Gather(
-                    &local_mpi_B_scale,
-                    1,
-                    MPI_FLOAT,
-                    is_root ? h_mpi_B_scales.data() : nullptr,
-                    1,
-                    MPI_FLOAT,
-                    0,
-                    MPI_COMM_WORLD));
-                CHECK_MPI(MPI_Gather(
-                    &local_mpi_B_residual_norm,
-                    1,
-                    MPI_FLOAT,
-                    is_root ? h_mpi_B_residual_norms.data() : nullptr,
-                    1,
-                    MPI_FLOAT,
-                    0,
-                    MPI_COMM_WORLD));
+                timed_mpi([&]() {
+                    return MPI_Gather(
+                        &local_mpi_B_scale,
+                        1,
+                        MPI_FLOAT,
+                        is_root ? h_mpi_B_scales.data() : nullptr,
+                        1,
+                        MPI_FLOAT,
+                        0,
+                        MPI_COMM_WORLD);
+                }, static_cast<unsigned long long>(sizeof(float)));
+                timed_mpi([&]() {
+                    return MPI_Gather(
+                        &local_mpi_B_residual_norm,
+                        1,
+                        MPI_FLOAT,
+                        is_root ? h_mpi_B_residual_norms.data() : nullptr,
+                        1,
+                        MPI_FLOAT,
+                        0,
+                        MPI_COMM_WORLD);
+                }, static_cast<unsigned long long>(sizeof(float)));
 
-                mpi_b_transmitted_payload_bytes = mpi_B_compressed.payload_bytes();
                 if (is_root) {
                     CHECK_CUDA(cudaSetDevice(0));
                     CHECK_CUDA(cudaMemset(d_B, 0, bi_fp32_bytes));
                     for (int r = 0; r < mpi.size; ++r) {
-                        CHECK_CUDA(cudaMemcpy(
+                        timed_host_copy(
                             d_mpi_B_codes_recv,
                             h_mpi_B_codes_all.data() + static_cast<size_t>(r) * bi_code_bytes,
                             bi_code_bytes,
-                            cudaMemcpyHostToDevice));
+                            cudaMemcpyHostToDevice);
                         turboquant::DeviceCompressedBlock rank_B = mpi_B_compressed;
                         rank_B.d_codes = d_mpi_B_codes_recv;
                         rank_B.scale = h_mpi_B_scales[r];
                         rank_B.residual_norm = h_mpi_B_residual_norms[r];
                         if (compress_b_tq) {
-                            CHECK_CUDA(cudaMemcpy(
+                            timed_host_copy(
                                 d_mpi_B_norms_recv,
-                                h_mpi_B_norms_all.data() + static_cast<size_t>(r) * n,
+                                h_mpi_B_norms_all.data() + static_cast<size_t>(r) * bi_norm_count,
                                 bi_norm_bytes,
-                                cudaMemcpyHostToDevice));
+                                cudaMemcpyHostToDevice);
                             rank_B.d_norms = d_mpi_B_norms_recv;
+                            rank_B.d_residual_norms = compress_b_qjl ? d_mpi_B_norms_recv + n : nullptr;
                         }
                         if (compress_b_qjl) {
-                            CHECK_CUDA(cudaMemcpy(
+                            timed_host_copy(
                                 d_mpi_B_qjl_signs_recv,
-                                h_mpi_B_qjl_signs_all.data() + static_cast<size_t>(r) * b_quant_options.qjl_dim,
+                                h_mpi_B_qjl_signs_all.data() + static_cast<size_t>(r) * bi_qjl_sign_bytes,
                                 bi_qjl_sign_bytes,
-                                cudaMemcpyHostToDevice));
+                                cudaMemcpyHostToDevice);
                             rank_B.d_qjl_signs = d_mpi_B_qjl_signs_recv;
                         }
                         if (b_quant_options.mode == turboquant::QuantizeMode::kTurboQuant ||
@@ -2046,8 +2259,11 @@ int main(int argc, char** argv) {
         long double global_b_error_norm2 = 0.0L;
         long double global_b_ref_norm2 = 0.0L;
         if (opt.check_b_error) {
+            Timer diagnostic_timer;
+            diagnostic_timer.tic();
             CHECK_MPI(MPI_Reduce(&b_error_norm2, &global_b_error_norm2, 1, MPI_LONG_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD));
             CHECK_MPI(MPI_Reduce(&b_ref_norm2, &global_b_ref_norm2, 1, MPI_LONG_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD));
+            diagnostic_excluded_ms += diagnostic_timer.toc_ms();
         }
         const double b_relative_error = (opt.check_b_error && is_root) ?
             std::sqrt(static_cast<double>(global_b_error_norm2 / std::max(global_b_ref_norm2, 1e-30L))) :
@@ -2055,6 +2271,8 @@ int main(int argc, char** argv) {
         double global_b_relative_error = -1.0;
         double global_b_exact_norm2 = -1.0;
         if (need_global_b_metric) {
+            Timer diagnostic_timer;
+            diagnostic_timer.tic();
             std::vector<float> h_B_exact_local(b_count);
             std::vector<float> h_B_exact_global;
             if (is_root) {
@@ -2098,6 +2316,7 @@ int main(int argc, char** argv) {
                     static_cast<double>(global_b_diff_norm) /
                     std::max(static_cast<double>(global_b_exact_norm), 1e-30);
             }
+            diagnostic_excluded_ms += diagnostic_timer.toc_ms();
         }
 
         timer.tic();
@@ -2140,14 +2359,14 @@ int main(int argc, char** argv) {
             std::vector<float> h_Uk(static_cast<size_t>(m) * k);
             NvtxRange range("form_distributed_Ui");
             std::vector<float> h_Ut_k(static_cast<size_t>(l) * k);
-            CHECK_CUDA(cudaMemcpy(h_Ut_k.data(), d_Ut_k, static_cast<size_t>(l) * k * sizeof(float), cudaMemcpyDeviceToHost));
+            timed_host_copy(h_Ut_k.data(), d_Ut_k, static_cast<size_t>(l) * k * sizeof(float), cudaMemcpyDeviceToHost);
 
             for (int g = 0; g < opt.ngpus; ++g) {
                 DeviceWork& w = works[g];
                 CHECK_CUDA(cudaSetDevice(w.dev));
                 CHECK_CUDA(cudaMalloc(&w.d_Uti_k, static_cast<size_t>(l) * k * sizeof(float)));
                 CHECK_CUDA(cudaMalloc(&w.d_Ui, static_cast<size_t>(w.mi) * k * sizeof(float)));
-                CHECK_CUDA(cudaMemcpy(w.d_Uti_k, h_Ut_k.data(), static_cast<size_t>(l) * k * sizeof(float), cudaMemcpyHostToDevice));
+                timed_host_copy(w.d_Uti_k, h_Ut_k.data(), static_cast<size_t>(l) * k * sizeof(float), cudaMemcpyHostToDevice);
                 const float alpha = 1.0f;
                 const float beta = 0.0f;
                 CHECK_CUBLAS(cublasSgemm(
@@ -2161,11 +2380,16 @@ int main(int argc, char** argv) {
                 CHECK_CUDA(cudaDeviceSynchronize());
 
                 std::vector<float> h_Ui(static_cast<size_t>(w.mi) * k);
-                CHECK_CUDA(cudaMemcpy(h_Ui.data(), w.d_Ui, static_cast<size_t>(w.mi) * k * sizeof(float), cudaMemcpyDeviceToHost));
-                insert_row_block_colmajor(h_Uk, h_Ui, m, k, w.row0, w.mi);
+                timed_host_copy(h_Ui.data(), w.d_Ui, static_cast<size_t>(w.mi) * k * sizeof(float), cudaMemcpyDeviceToHost);
+                timed_host_stage([&]() {
+                    insert_row_block_colmajor(h_Uk, h_Ui, m, k, w.row0, w.mi);
+                });
             }
             t_form_distributed_u_ms = timer.toc_ms();
         }
+
+        const double total_algorithm_ms =
+            std::max(total_timer.toc_ms() - diagnostic_excluded_ms, 0.0);
 
         std::vector<float> h_S(l);
         if (is_root) {
@@ -2261,60 +2485,43 @@ int main(int argc, char** argv) {
             }
         }
 
-        const double t_gpu_compute_reported =
+        const double gross_gpu_sections_ms =
             t_local_projection_ms + t_local_qr_ms + t_tsqr_reduce_ms + t_form_distributed_q_ms +
             t_subspace_iter_ms + t_build_b_reduce_ms + t_svd_b_ms + t_form_distributed_u_ms;
-        const double t_iter_init_ms = (repeat_idx == 0) ? t_init_ms : 0.0;
-        const double t_iter_setup_ms = (repeat_idx == 0) ? t_setup_gpu_resources_ms : 0.0;
-        const double t_total_reported = t_iter_init_ms + t_iter_setup_ms + t_gpu_compute_reported;
-        const double t_gpu_pipeline_reported = t_iter_setup_ms + t_gpu_compute_reported;
-        double t_gpu_compute_reported_max = 0.0;
-        double t_gpu_pipeline_reported_max = 0.0;
-        double stage_local[kStageCount] = {
-            t_local_projection_ms,
-            t_local_qr_ms,
-            t_tsqr_reduce_ms,
-            t_form_distributed_q_ms,
-            t_subspace_iter_ms,
-            t_build_b_reduce_ms,
-            t_svd_b_ms,
-            t_form_distributed_u_ms,
-        };
-        double stage_max[kStageCount] = {};
-        CHECK_MPI(MPI_Reduce(&t_gpu_compute_reported, &t_gpu_compute_reported_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD));
-        CHECK_MPI(MPI_Reduce(&t_gpu_pipeline_reported, &t_gpu_pipeline_reported_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD));
-        CHECK_MPI(MPI_Reduce(stage_local, stage_max, kStageCount, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD));
-        unsigned long long r_payload_bytes_global = 0;
-        unsigned long long z_fp32_payload_bytes_global = 0;
-        unsigned long long z_transmitted_payload_bytes_global = 0;
-        unsigned long long b_fp32_payload_bytes_global = 0;
-        unsigned long long b_transmitted_payload_bytes_global = 0;
-        unsigned long long mpi_b_fp32_payload_bytes_global = 0;
-        unsigned long long mpi_b_transmitted_payload_bytes_global = 0;
-        const unsigned long long r_payload_bytes_local_ull = static_cast<unsigned long long>(r_payload_bytes);
-        const unsigned long long z_fp32_payload_bytes_local_ull = static_cast<unsigned long long>(z_fp32_payload_bytes);
-        const unsigned long long z_transmitted_payload_bytes_local_ull = static_cast<unsigned long long>(z_transmitted_payload_bytes);
-        const unsigned long long b_fp32_payload_bytes_local_ull = static_cast<unsigned long long>(b_fp32_payload_bytes);
-        const unsigned long long b_transmitted_payload_bytes_local_ull = static_cast<unsigned long long>(b_transmitted_payload_bytes);
-        const unsigned long long mpi_b_fp32_payload_bytes_local_ull = static_cast<unsigned long long>(mpi_b_fp32_payload_bytes);
-        const unsigned long long mpi_b_transmitted_payload_bytes_local_ull = static_cast<unsigned long long>(mpi_b_transmitted_payload_bytes);
-        double t_compress_subspace_ms_max = 0.0;
-        double t_compress_b_ms_max = 0.0;
-        CHECK_MPI(MPI_Reduce(&r_payload_bytes_local_ull, &r_payload_bytes_global, 1, MPI_UNSIGNED_LONG_LONG, MPI_SUM, 0, MPI_COMM_WORLD));
-        CHECK_MPI(MPI_Reduce(&z_fp32_payload_bytes_local_ull, &z_fp32_payload_bytes_global, 1, MPI_UNSIGNED_LONG_LONG, MPI_SUM, 0, MPI_COMM_WORLD));
-        CHECK_MPI(MPI_Reduce(&z_transmitted_payload_bytes_local_ull, &z_transmitted_payload_bytes_global, 1, MPI_UNSIGNED_LONG_LONG, MPI_SUM, 0, MPI_COMM_WORLD));
-        CHECK_MPI(MPI_Reduce(&b_fp32_payload_bytes_local_ull, &b_fp32_payload_bytes_global, 1, MPI_UNSIGNED_LONG_LONG, MPI_SUM, 0, MPI_COMM_WORLD));
-        CHECK_MPI(MPI_Reduce(&b_transmitted_payload_bytes_local_ull, &b_transmitted_payload_bytes_global, 1, MPI_UNSIGNED_LONG_LONG, MPI_SUM, 0, MPI_COMM_WORLD));
-        CHECK_MPI(MPI_Reduce(&mpi_b_fp32_payload_bytes_local_ull, &mpi_b_fp32_payload_bytes_global, 1, MPI_UNSIGNED_LONG_LONG, MPI_SUM, 0, MPI_COMM_WORLD));
-        CHECK_MPI(MPI_Reduce(&mpi_b_transmitted_payload_bytes_local_ull, &mpi_b_transmitted_payload_bytes_global, 1, MPI_UNSIGNED_LONG_LONG, MPI_SUM, 0, MPI_COMM_WORLD));
-        CHECK_MPI(MPI_Reduce(&t_compress_subspace_ms, &t_compress_subspace_ms_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD));
-        CHECK_MPI(MPI_Reduce(&t_compress_b_ms, &t_compress_b_ms_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD));
+        const double gpu_compute_ms = std::max(
+            gross_gpu_sections_ms - host_staging_time_ms - infiniband_time_ms - nvlink_time_ms - diagnostic_excluded_ms,
+            0.0);
+        const double other_sync_ms = std::max(
+            total_algorithm_ms - gpu_compute_ms - host_staging_time_ms - nvlink_time_ms - infiniband_time_ms,
+            0.0);
+        double total_algorithm_ms_max = 0.0;
+        double gpu_compute_ms_max = 0.0;
+        double host_staging_time_ms_max = 0.0;
+        double nvlink_time_ms_max = 0.0;
+        double infiniband_time_ms_max = 0.0;
+        double other_sync_ms_max = 0.0;
+        unsigned long long host_gpu_payload_bytes_global = 0;
+        unsigned long long nvlink_payload_bytes_global = 0;
+        unsigned long long infiniband_payload_bytes_global = 0;
+        CHECK_MPI(MPI_Reduce(&total_algorithm_ms, &total_algorithm_ms_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD));
+        CHECK_MPI(MPI_Reduce(&gpu_compute_ms, &gpu_compute_ms_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD));
+        CHECK_MPI(MPI_Reduce(&host_staging_time_ms, &host_staging_time_ms_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD));
+        CHECK_MPI(MPI_Reduce(&nvlink_time_ms, &nvlink_time_ms_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD));
+        CHECK_MPI(MPI_Reduce(&infiniband_time_ms, &infiniband_time_ms_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD));
+        CHECK_MPI(MPI_Reduce(&other_sync_ms, &other_sync_ms_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD));
+        CHECK_MPI(MPI_Reduce(&host_gpu_payload_bytes, &host_gpu_payload_bytes_global, 1, MPI_UNSIGNED_LONG_LONG, MPI_SUM, 0, MPI_COMM_WORLD));
+        CHECK_MPI(MPI_Reduce(&nvlink_payload_bytes, &nvlink_payload_bytes_global, 1, MPI_UNSIGNED_LONG_LONG, MPI_SUM, 0, MPI_COMM_WORLD));
+        CHECK_MPI(MPI_Reduce(&infiniband_payload_bytes, &infiniband_payload_bytes_global, 1, MPI_UNSIGNED_LONG_LONG, MPI_SUM, 0, MPI_COMM_WORLD));
         if (is_root) {
-            repeat_pipeline_ms.push_back(t_gpu_pipeline_reported_max);
-            repeat_compute_ms.push_back(t_gpu_compute_reported_max);
-            for (int i = 0; i < kStageCount; ++i) {
-                repeat_stage_ms[i].push_back(stage_max[i]);
-            }
+            repeat_total_ms.push_back(total_algorithm_ms_max);
+            repeat_gpu_compute_ms.push_back(gpu_compute_ms_max);
+            repeat_host_staging_ms.push_back(host_staging_time_ms_max);
+            repeat_nvlink_ms.push_back(nvlink_time_ms_max);
+            repeat_infiniband_ms.push_back(infiniband_time_ms_max);
+            repeat_other_sync_ms.push_back(other_sync_ms_max);
+            repeat_host_gpu_payload_bytes.push_back(static_cast<double>(host_gpu_payload_bytes_global));
+            repeat_nvlink_payload_bytes.push_back(static_cast<double>(nvlink_payload_bytes_global));
+            repeat_infiniband_payload_bytes.push_back(static_cast<double>(infiniband_payload_bytes_global));
             if (opt.check_b_error) {
                 repeat_b_relative_error.push_back(b_relative_error);
             }
@@ -2327,76 +2534,23 @@ int main(int argc, char** argv) {
         }
 
         if (is_root && print_repeat_detail) {
-            std::cout << "\nTimings (ms)\n"
-                      << "  init_host_random          " << t_iter_init_ms << "\n"
-                      << "  create_gpu_handles        " << ((repeat_idx == 0) ? t_create_gpu_handles_ms : 0.0) << "\n"
-                      << "  allocate_gpu_buffers      " << ((repeat_idx == 0) ? t_allocate_gpu_buffers_ms : 0.0) << "\n"
-                      << "  generate_test_matrix      " << ((repeat_idx == 0) ? t_generate_test_matrix_ms : 0.0) << "\n"
-                      << "  setup_gpu_resources       " << t_iter_setup_ms << "\n"
-                      << "  local_projection_Yi       " << t_local_projection_ms << "\n"
-                      << "  local_qr_Yi               " << t_local_qr_ms << "\n"
-                      << "  tsqr_R_reduce_gpu0        " << t_tsqr_reduce_ms << "\n"
-                      << "  form_distributed_Qi       " << t_form_distributed_q_ms << "\n"
-                      << "  subspace_iteration        " << t_subspace_iter_ms << "\n"
-                      << "  build_reduce_Bi           " << t_build_b_reduce_ms << "\n"
-                      << "  svd_B_on_gpu0             " << t_svd_b_ms << "\n"
-                      << "  form_distributed_Ui       " << t_form_distributed_u_ms << "\n"
-                      << "  gpu_pipeline_reported     " << t_gpu_pipeline_reported_max << "\n"
-                      << "  gpu_compute_reported      " << t_gpu_compute_reported_max << "\n"
-                      << "  subtotal_reported         " << t_total_reported << "\n";
-
-            std::cout << "\nCommunication baseline\n"
-                      << "  tsqr_R_payload_bytes      " << r_payload_bytes_global << "\n"
-                      << "  tsqr_R_payload_MiB        " << (r_payload_bytes_global / 1024.0 / 1024.0) << "\n"
-                      << "  subspace_Z_quant_mode     " << turboquant::mode_name(subspace_quant_options.mode) << "\n"
-                      << "  subspace_Z_quant_bits     " << opt.compress_subspace_bits << "\n"
-                      << "  subspace_Z_tq_codec       "
-                      << (compress_subspace_lloyd_tq ? "rht_lloyd_max_d256_norm" : "n/a") << "\n"
-                      << "  subspace_Z_qjl_dim        " << subspace_quant_options.qjl_dim << "\n"
-                      << "  subspace_Z_qjl_alpha      " << subspace_quant_options.qjl_alpha << "\n"
-                      << "  subspace_Z_vector_layout  " << (compress_subspace_none ? "n/a" : "row_vectors_length_l") << "\n"
-                      << "  subspace_Z_fp32_bytes     " << z_fp32_payload_bytes_global << "\n"
-                      << "  subspace_Z_fp32_MiB       " << (z_fp32_payload_bytes_global / 1024.0 / 1024.0) << "\n"
-                      << "  subspace_Z_payload_bytes  " << z_transmitted_payload_bytes_global << "\n"
-                      << "  subspace_Z_payload_MiB    " << (z_transmitted_payload_bytes_global / 1024.0 / 1024.0) << "\n"
-                      << "  subspace_Z_compression_ratio "
-                      << (static_cast<double>(z_fp32_payload_bytes_global) /
-                          static_cast<double>(std::max<unsigned long long>(z_transmitted_payload_bytes_global, 1))) << "\n"
-                      << "  subspace_Z_compress_time_ms " << t_compress_subspace_ms_max << "\n"
-                      << "  subspace_Z_collective_mode "
-                      << (compress_subspace_none ? "fp32_allreduce" : "compressed_allgather_decode_rowwise") << "\n"
-                      << "  reduce_B_quant_mode       " << turboquant::mode_name(b_quant_options.mode) << "\n"
-                      << "  reduce_B_quant_bits       " << opt.compress_b_bits << "\n"
-                      << "  reduce_B_tq_codec         "
-                      << (compress_b_tq ? "rht_lloyd_max_d256_norm" : "n/a") << "\n"
-                      << "  reduce_B_qjl_dim          " << b_quant_options.qjl_dim << "\n"
-                      << "  reduce_B_qjl_alpha        " << b_quant_options.qjl_alpha << "\n"
-                      << "  reduce_B_fp32_bytes       " << b_fp32_payload_bytes_global << "\n"
-                      << "  reduce_B_fp32_MiB         " << (b_fp32_payload_bytes_global / 1024.0 / 1024.0) << "\n"
-                      << "  reduce_B_payload_bytes    " << b_transmitted_payload_bytes_global << "\n"
-                      << "  reduce_B_payload_MiB      " << (b_transmitted_payload_bytes_global / 1024.0 / 1024.0) << "\n"
-                      << "  reduce_B_compression_ratio "
-                      << (static_cast<double>(b_fp32_payload_bytes_global) /
-                          static_cast<double>(std::max<unsigned long long>(b_transmitted_payload_bytes_global, 1))) << "\n"
-                      << "  reduce_B_relative_error   "
-                      << (opt.check_b_error ? std::to_string(b_relative_error) : std::string("skipped")) << "\n"
-                      << "  global_B_relative_error   "
-                      << (global_b_relative_error >= 0.0 ? std::to_string(global_b_relative_error) : std::string("skipped")) << "\n"
-                      << "  reduce_B_compress_time_ms " << t_compress_b_ms_max << "\n"
-                      << "  mpi_B_collective_mode     " << (compress_b_none ? "fp32_reduce" : "compressed_gather_decode") << "\n"
-                      << "  mpi_B_fp32_bytes          " << mpi_b_fp32_payload_bytes_global << "\n"
-                      << "  mpi_B_fp32_MiB            " << (mpi_b_fp32_payload_bytes_global / 1024.0 / 1024.0) << "\n"
-                      << "  mpi_B_payload_bytes       " << mpi_b_transmitted_payload_bytes_global << "\n"
-                      << "  mpi_B_payload_MiB         " << (mpi_b_transmitted_payload_bytes_global / 1024.0 / 1024.0) << "\n"
-                      << "  mpi_B_compression_ratio   "
-                      << (static_cast<double>(mpi_b_fp32_payload_bytes_global) /
-                          static_cast<double>(std::max<unsigned long long>(mpi_b_transmitted_payload_bytes_global, 1))) << "\n";
-
-            std::cout << "\nLeading singular values\n  ";
-            for (int i = 0; i < std::min(k, 10); ++i) {
-                std::cout << h_S[i] << (i + 1 == std::min(k, 10) ? "" : ", ");
+            const double mib_scale = 1.0 / 1024.0 / 1024.0;
+            if (report_timing_summary) {
+                std::cout << "\nTiming Summary (repeat)\n"
+                          << "  Total Time          " << total_algorithm_ms_max << " ms\n"
+                          << "  GPU Compute Time    " << gpu_compute_ms_max << " ms\n"
+                          << "  Host/Staging Time   " << host_staging_time_ms_max << " ms\n"
+                          << "  NVLink Time         " << nvlink_time_ms_max << " ms\n"
+                          << "  InfiniBand Time     " << infiniband_time_ms_max << " ms\n"
+                          << "  Other/Sync Time     " << other_sync_ms_max << " ms\n";
+                std::cout << "\nPayload Summary (repeat)\n"
+                          << "  Host-GPU Payload    "
+                          << (static_cast<double>(host_gpu_payload_bytes_global) * mib_scale) << " MiB\n"
+                          << "  NVLink Payload      "
+                          << (static_cast<double>(nvlink_payload_bytes_global) * mib_scale) << " MiB\n"
+                          << "  InfiniBand Payload  "
+                          << (static_cast<double>(infiniband_payload_bytes_global) * mib_scale) << " MiB\n";
             }
-            std::cout << "\n";
             if (opt.check_error) {
                 std::cout << "\nRelative Frobenius reconstruction error\n"
                           << "  metric = "
@@ -2427,25 +2581,53 @@ int main(int argc, char** argv) {
             const size_t cold_count = (opt.repeat > 1) ? 1 : 0;
             const size_t warm_begin = (opt.repeat > 1) ? 1 : 0;
             const size_t warm_count = opt.repeat - cold_count;
-            const SummaryStats total_stats = summarize_samples(repeat_compute_ms, warm_begin);
             const int label_width = 32;
-            const bool timing_only = !opt.check_error && !opt.check_b_error;
             const bool accuracy_summary = opt.check_error || opt.check_b_error;
 
-            std::cout << "\nSummary\n"
-                      << "Repeat Count: " << opt.repeat
-                      << " (warm: " << warm_count
-                      << " | cold: " << cold_count << ")\n";
+            if (report_timing_summary) {
+                std::cout << "\nTiming Summary\n"
+                          << "Repeat Count: " << opt.repeat
+                          << " (warm: " << warm_count
+                          << " | cold: " << cold_count << ")\n";
 
-            if (timing_only) {
-                std::cout <<  std::setw(label_width) << std::right << ""
+                std::cout <<  std::setw(label_width) << std::right << "Metric"
                           <<  std::setw(16) << std::right << "mean"
                           <<  std::setw(16) << std::right << "min"
                           <<  std::setw(16) << std::right << "stddev" << "\n";
-                print_summary_stats_row("Total Time", total_stats, label_width);
+                print_summary_stats_row("Total Time", summarize_samples(repeat_total_ms, warm_begin), label_width, 1.0, " ms");
+                print_summary_stats_row("GPU Compute Time", summarize_samples(repeat_gpu_compute_ms, warm_begin), label_width, 1.0, " ms");
+                print_summary_stats_row("Host/Staging Time", summarize_samples(repeat_host_staging_ms, warm_begin), label_width, 1.0, " ms");
+                print_summary_stats_row("NVLink Time", summarize_samples(repeat_nvlink_ms, warm_begin), label_width, 1.0, " ms");
+                print_summary_stats_row("InfiniBand Time", summarize_samples(repeat_infiniband_ms, warm_begin), label_width, 1.0, " ms");
+                print_summary_stats_row("Other/Sync Time", summarize_samples(repeat_other_sync_ms, warm_begin), label_width, 1.0, " ms");
+
+                std::cout << "\nPayload Summary\n"
+                          <<  std::setw(label_width) << std::right << "Metric"
+                          <<  std::setw(16) << std::right << "mean"
+                          <<  std::setw(16) << std::right << "min"
+                          <<  std::setw(16) << std::right << "stddev" << "\n";
+                print_summary_stats_row(
+                    "Host-GPU Payload",
+                    summarize_samples(repeat_host_gpu_payload_bytes, warm_begin),
+                    label_width,
+                    1.0 / 1024.0 / 1024.0,
+                    " MiB");
+                print_summary_stats_row(
+                    "NVLink Payload",
+                    summarize_samples(repeat_nvlink_payload_bytes, warm_begin),
+                    label_width,
+                    1.0 / 1024.0 / 1024.0,
+                    " MiB");
+                print_summary_stats_row(
+                    "InfiniBand Payload",
+                    summarize_samples(repeat_infiniband_payload_bytes, warm_begin),
+                    label_width,
+                    1.0 / 1024.0 / 1024.0,
+                    " MiB");
             }
 
             if (accuracy_summary) {
+                std::cout << "\nAccuracy Summary\n";
                 if (!repeat_global_b_relative_error.empty()) {
                     std::cout <<  std::setw(label_width) << std::right << ""
                               <<  std::setw(16) << std::right << "mean"
@@ -2488,16 +2670,6 @@ int main(int argc, char** argv) {
                         theoretical_error,
                         label_width);
                 }
-            }
-
-            std::cout << "\nStages\n"
-                      <<  std::setw(label_width) << std::right << "stage"
-                      <<  std::setw(16) << std::right << "mean"
-                      <<  std::setw(16) << std::right << "min"
-                      <<  std::setw(16) << std::right << "stddev" << "\n";
-            for (int i = 0; i < kStageCount; ++i) {
-                const SummaryStats stats = summarize_samples(repeat_stage_ms[i], warm_begin);
-                print_summary_stats_row(stage_names[i], stats, label_width);
             }
         }
 
@@ -2547,7 +2719,16 @@ int main(int argc, char** argv) {
         for (float* p : d_Bi_norms_on_gpu0) {
             if (p) cudaFree(p);
         }
-        for (int* p : d_Bi_qjl_signs_on_gpu0) {
+        for (std::uint8_t* p : d_Bi_qjl_signs_on_gpu0) {
+            if (p) cudaFree(p);
+        }
+        for (std::uint8_t* p : d_Z_codes_on_gpu0) {
+            if (p) cudaFree(p);
+        }
+        for (float* p : d_Z_norms_on_gpu0) {
+            if (p) cudaFree(p);
+        }
+        for (std::uint8_t* p : d_Z_qjl_signs_on_gpu0) {
             if (p) cudaFree(p);
         }
         cudaFree(d_info0);

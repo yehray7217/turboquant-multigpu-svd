@@ -27,8 +27,8 @@ make
 cd "${PROJECT_ROOT}/exp_turboquant_8bit"
 
 BASE_ARGS=(
-    --m 32768
-    --n 8192
+    --m 65536
+    --n 16384
     --k 250
     --oversample 6
     --ngpus 16
@@ -47,7 +47,7 @@ BASE_ARGS=(
     --summary-only
 )
 
-echo "Starting control group: no compression"
+echo "Starting control group: no TQ"
 echo "Date: $(date)"
 echo "Host: $(hostname)"
 echo "SLURM_JOB_NODELIST=${SLURM_JOB_NODELIST}"

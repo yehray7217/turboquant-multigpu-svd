@@ -57,7 +57,8 @@ struct DeviceCompressedBlock {
     QuantizeMode mode = QuantizeMode::kNone;
     std::uint8_t* d_codes = nullptr;
     float* d_norms = nullptr;
-    int* d_qjl_signs = nullptr;
+    float* d_residual_norms = nullptr;
+    std::uint8_t* d_qjl_signs = nullptr;
 
     std::size_t value_count() const;
     std::size_t code_bytes() const;
@@ -103,6 +104,8 @@ CompressedBlock quantize_dequant_fp32_device_block_to_device(
     bool copy_payload_to_host = true);
 
 std::size_t device_code_bytes(int rows, int cols, const QuantizeOptions& options);
+std::size_t device_norm_bytes(int rows, int cols, const QuantizeOptions& options);
+std::size_t device_qjl_sign_bytes(int rows, int cols, const QuantizeOptions& options);
 
 void initialize_column_tq_signs(
     int rows,
@@ -117,13 +120,8 @@ DeviceCompressedBlock quantize_fp32_device_block_to_device_payload(
     int cols,
     const QuantizeOptions& options,
     std::uint8_t* d_codes,
-    int* d_qjl_signs,
+    std::uint8_t* d_qjl_signs,
     cudaStream_t stream = 0);
-
-// blocks_per_sketch is a fixed internal constant (128) used by the QJL dot-product
-// kernel in the column TQ path. Pre-allocate d_qjl_partials as
-// (qjl_dim * kQjlColumnBlocksPerSketch) floats to avoid per-call cudaMalloc.
-static constexpr int kQjlColumnBlocksPerSketch = 128;
 
 DeviceCompressedBlock quantize_fp32_device_column_tq_to_device_payload(
     const float* d_values,
@@ -134,12 +132,11 @@ DeviceCompressedBlock quantize_fp32_device_column_tq_to_device_payload(
     float* d_norms = nullptr,
     float* d_work = nullptr,
     const signed char* d_signs = nullptr,
-    int* d_qjl_signs = nullptr,
+    std::uint8_t* d_qjl_signs = nullptr,
     // Optional pre-allocated QJL scratch buffers (avoid per-call cudaMalloc in
     // the hot loop). If null, the function allocates and frees them internally.
     float* d_qjl_reconstructed = nullptr, // size: rows * cols floats
     float* d_qjl_residual = nullptr,      // size: rows * cols floats
-    float* d_qjl_partials = nullptr,      // size: qjl_dim * kQjlColumnBlocksPerSketch floats
     cudaStream_t stream = 0);
 
 inline DeviceCompressedBlock quantize_fp32_device_column_tq_to_device_payload(
@@ -150,10 +147,9 @@ inline DeviceCompressedBlock quantize_fp32_device_column_tq_to_device_payload(
     std::uint8_t* d_codes,
     float* d_work,
     const signed char* d_signs,
-    int* d_qjl_signs,
+    std::uint8_t* d_qjl_signs,
     float* d_qjl_reconstructed = nullptr,
     float* d_qjl_residual = nullptr,
-    float* d_qjl_partials = nullptr,
     cudaStream_t stream = 0) {
     return quantize_fp32_device_column_tq_to_device_payload(
         d_values,
@@ -167,7 +163,6 @@ inline DeviceCompressedBlock quantize_fp32_device_column_tq_to_device_payload(
         d_qjl_signs,
         d_qjl_reconstructed,
         d_qjl_residual,
-        d_qjl_partials,
         stream);
 }
 
