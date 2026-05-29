@@ -133,8 +133,8 @@ DeviceCompressedBlock quantize_fp32_device_column_tq_to_device_payload(
     float* d_work = nullptr,
     const signed char* d_signs = nullptr,
     std::uint8_t* d_qjl_signs = nullptr,
-    // Optional pre-allocated QJL scratch buffers (avoid per-call cudaMalloc in
-    // the hot loop). If null, the function allocates and frees them internally.
+    // Optional pre-allocated QJL scratch buffers. If null, turboquant reuses
+    // cached per-device scratch buffers instead of allocating in the hot loop.
     float* d_qjl_reconstructed = nullptr, // size: rows * cols floats
     float* d_qjl_residual = nullptr,      // size: rows * cols floats
     cudaStream_t stream = 0);

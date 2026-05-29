@@ -2,15 +2,43 @@
 
 > Note: 可以直接把 `turboquant-multigpu-svd/randomized_svd_baseline_v4/skills/PROJECT_CONTEXT.md` 拿去餵給 AI，讓它 follow up 最新的進度。
 
+# 05/30
+
+## 修好 QJL
+
+修好了 QJL。
+
+
+## 新增 payload metric
+
+增加一個 metric：Payload，代表中間搬了多少資料。
+
+已新增：Host-GPU Payload、NVLink Payload、InfiniBand Payload。
+
+## 重構 Timing 測量方式
+
+現在輸出 Total Time、GPU Compute Time、Host/Staging Time、NVLink Time、InfiniBand Time、Other/Sync Time。
+
+因為我們做的是通訊成本的優化，改以這種呈現方式才符合我們的主題。
+
+
+## 修改並正式確定 TurboQuant 實作
+
+已經將 TurboQuant 正式改成 RHT + Lloyd-Max scalar quantization + normal rescaling。
+
+Lloyd-Max 那部分是直接從官方 [TurboQuant reference implementation GitHub repo 那邊抓 codebook.py](https://github.com/0xSero/turboquant/blob/main/turboquant/codebook.py) 在我本地預先生成並存成 JSON 檔（在 `turboquant/codebook`），然後請 AI agent 將生出來的 JSON 檔 hard-coded 到 `turboquant/tq_codebooks_generated.hpp`。
+
+目前的 TQ 支援 $d = 256, 512, 1024, 2048$ 和 $\text{bits} = 2, 3, \cdots, 6, 7, 8$。
+
+
+
+# 05/28
 
 ## Randomized SVD 增加 subspace iteration
 
-將 rSVD 引入 subspace iteration。
+將 rSVD 引入 subspace iteration，並且同樣套用 TurboQuant compression。
 
 實驗之後發現 iteration 做 1 次是最好的。
-
-效果：overhead 變得很大（48ms 變成 203ms）。但這是因為 TQ 目前只 apply 到 B，沒有 apply 到 subspace iteration。
-
 
 
 

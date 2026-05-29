@@ -9,8 +9,8 @@ test*.png
 test*.jpg
 test*.webp
 
-.build
-.debug
+randomized_svd_baseline_v4/.build/*
+randomized_svd_baseline_v4/.debug/*
 
 *.out
 *.err

@@ -135,7 +135,7 @@ struct Options {
     int compress_b_bits = 0;
     std::string compress_subspace_mode = "none";
     int compress_subspace_bits = 0;
-    int qjl_dim = 256;
+    int qjl_dim = 0; // 0 means use vector dimension d = l
     float qjl_alpha = 1.0f;
     bool device_random_input = false;
     bool skip_form_u = false;
@@ -168,7 +168,7 @@ static void print_usage(const char* prog) {
         << "                        Z = A^T Q compression mode inside subspace iteration. Default: none\n"
         << "  --compress-subspace-bits <0|2..8>\n"
         << "                        Z = A^T Q quantization bits. mode=tq supports 2..8; tq-qjl supports 3..8; lowbit supports 2/4/8. Default: 0\n"
-        << "  --qjl-dim <int>       QJL residual sketch dimension for tq-qjl. Default: 256\n"
+        << "  --qjl-dim <int>       QJL residual sketch dimension for tq-qjl. Default: vector dimension l\n"
         << "  --qjl-alpha <float>   QJL residual correction strength. Default: 1.0\n"
         << "  --device-random-input\n"
         << "                        Generate A_i and Omega directly on each GPU.\n"
@@ -731,6 +731,7 @@ int main(int argc, char** argv) {
                       << " compress_b_bits=" << opt.compress_b_bits
                       << " compress_subspace_mode=" << opt.compress_subspace_mode
                       << " compress_subspace_bits=" << opt.compress_subspace_bits
+                      << " qjl_dim=" << (opt.qjl_dim > 0 ? std::to_string(opt.qjl_dim) : std::string("auto"))
                       << " qjl_alpha=" << opt.qjl_alpha
                       << " device_random_input=" << (opt.device_random_input ? "yes" : "no")
                       << " skip_form_u=" << (opt.skip_form_u ? "yes" : "no")
@@ -792,6 +793,22 @@ int main(int argc, char** argv) {
                 opt.qjl_dim,
                 opt.qjl_alpha,
                 opt.seed + 7919u);
+        auto print_qjl_diagnostic = [&](const char* label, const turboquant::QuantizeOptions& options) {
+            if (!is_root || options.mode != turboquant::QuantizeMode::kTurboQuantQjl) return;
+            const int qjl_dim = options.qjl_dim > 0 ? options.qjl_dim : l;
+            const int mse_bits = options.bits - 1;
+            const double effective_bits =
+                static_cast<double>(mse_bits) + static_cast<double>(qjl_dim) / static_cast<double>(l);
+            std::cout << "TQ-QJL active (" << label << "): dim=" << l
+                      << ", total_bits=" << options.bits
+                      << ", mse_bits=" << mse_bits
+                      << ", qjl_dim=" << qjl_dim
+                      << ", qjl_alpha=" << options.qjl_alpha
+                      << ", effective_bits_per_coordinate=" << effective_bits
+                      << "\n";
+        };
+        print_qjl_diagnostic("B", b_quant_options);
+        print_qjl_diagnostic("subspace", subspace_quant_options);
         const bool compress_b_none = b_quant_options.mode == turboquant::QuantizeMode::kNone;
         const bool compress_b_qjl = b_quant_options.mode == turboquant::QuantizeMode::kTurboQuantQjl;
         const bool compress_b_tq =

@@ -1,6 +1,7 @@
 #include "turboquant.hpp"
 #include "tq_codebooks_generated.hpp"
 
+#include <cublas_v2.h>
 #include <cuda_runtime.h>
 #include <thrust/device_ptr.h>
 #include <thrust/extrema.h>
@@ -15,11 +16,13 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace turboquant {
 namespace {
 
 void check_cuda(cudaError_t status, const char* label);
+void check_cublas(cublasStatus_t status, const char* label);
 
 // (README) 量化範圍設定: 根據 bit 數決定對稱 signed quantization 可使用的最大整數值。
 int qmax_for_bits(int bits) {
@@ -157,6 +160,11 @@ int tq_mse_bits_for_options(const QuantizeOptions& options) {
     return options.bits;
 }
 
+int effective_qjl_dim(int rows, const QuantizeOptions& options) {
+    if (options.mode != QuantizeMode::kTurboQuantQjl) return 0;
+    return (options.qjl_dim > 0) ? options.qjl_dim : rows;
+}
+
 std::size_t bitpacked_code_bytes(int rows, int cols, int bits) {
     const std::size_t bit_count =
         static_cast<std::size_t>(rows) * static_cast<std::size_t>(cols) *
@@ -174,13 +182,14 @@ std::size_t lloyd_tq_code_bytes(int rows, int cols, int bits) {
     return bitpacked_code_bytes(rows, cols, bits);
 }
 
-std::size_t lloyd_tq_sign_bytes(int rows, int cols) {
+std::size_t qjl_sign_bytes(int rows, int cols, int qjl_dim) {
     if (!is_supported_lloyd_tq_dim(rows)) {
         throw std::runtime_error("QJL sign path requires vector dimension d in {256, 512, 1024, 2048}.");
     }
-    const std::size_t bit_count =
-        static_cast<std::size_t>(rows) * static_cast<std::size_t>(cols);
-    return (bit_count + 7U) / 8U;
+    if (qjl_dim <= 0) {
+        throw std::runtime_error("QJL sign path requires positive qjl_dim.");
+    }
+    return bitpacked_code_bytes(qjl_dim, cols, 1);
 }
 
 void validate_column_tq_options(int rows, int cols, const QuantizeOptions& options, const char* context) {
@@ -201,6 +210,9 @@ void validate_column_tq_options(int rows, int cols, const QuantizeOptions& optio
     if (options.mode == QuantizeMode::kTurboQuantQjl) {
         if (options.bits < 3 || options.bits > 8) {
             throw std::runtime_error(std::string(context) + " mode=tq-qjl requires total bits in [3, 8].");
+        }
+        if (options.qjl_dim < 0) {
+            throw std::runtime_error(std::string(context) + " mode=tq-qjl requires qjl_dim >= 0.");
         }
         if (!is_supported_lloyd_tq_bits(options.bits - 1)) {
             throw std::runtime_error(std::string(context) + " mode=tq-qjl requires MSE bits in [2, 7].");
@@ -246,6 +258,160 @@ __device__ int bitpack_read_code(const std::uint8_t* packed, std::size_t idx, in
         value |= words[word_idx + 1] << (32 - shift);
     }
     return static_cast<int>(value & mask);
+}
+
+struct QjlMatrixCacheEntry {
+    int device = -1;
+    int rows = 0;
+    int qjl_dim = 0;
+    unsigned seed = 0;
+    float* d_S = nullptr;
+};
+
+struct QjlScratchCacheEntry {
+    int device = -1;
+    std::size_t projection_count = 0;
+    std::size_t signs_float_count = 0;
+    std::size_t residual_hat_count = 0;
+    std::size_t reconstructed_count = 0;
+    std::size_t residual_count = 0;
+    float* d_projection = nullptr;
+    float* d_signs_float = nullptr;
+    float* d_residual_hat = nullptr;
+    float* d_reconstructed = nullptr;
+    float* d_residual = nullptr;
+};
+
+struct CublasHandleCacheEntry {
+    int device = -1;
+    cublasHandle_t handle = nullptr;
+};
+
+std::vector<QjlMatrixCacheEntry>& qjl_matrix_cache() {
+    static std::vector<QjlMatrixCacheEntry> cache;
+    return cache;
+}
+
+std::vector<QjlScratchCacheEntry>& qjl_scratch_cache() {
+    static std::vector<QjlScratchCacheEntry> cache;
+    return cache;
+}
+
+std::vector<CublasHandleCacheEntry>& cublas_handle_cache() {
+    static std::vector<CublasHandleCacheEntry> cache;
+    return cache;
+}
+
+float* reserve_float_buffer(float*& ptr, std::size_t& capacity, std::size_t required, const char* label) {
+    if (required == 0) return ptr;
+    if (capacity >= required && ptr) return ptr;
+    if (ptr) {
+        cudaFree(ptr);
+        ptr = nullptr;
+        capacity = 0;
+    }
+    check_cuda(cudaMalloc(&ptr, required * sizeof(float)), label);
+    capacity = required;
+    return ptr;
+}
+
+float* get_qjl_matrix_device(int rows, int qjl_dim, unsigned seed) {
+    if (!is_supported_lloyd_tq_dim(rows) || qjl_dim <= 0) {
+        throw std::runtime_error("QJL matrix requires supported dim and positive qjl_dim.");
+    }
+    int device = 0;
+    check_cuda(cudaGetDevice(&device), "cudaGetDevice QJL matrix cache");
+    auto& cache = qjl_matrix_cache();
+    for (auto& entry : cache) {
+        if (entry.device == device && entry.rows == rows &&
+            entry.qjl_dim == qjl_dim && entry.seed == seed) {
+            return entry.d_S;
+        }
+    }
+
+    std::vector<float> h_S(static_cast<std::size_t>(qjl_dim) * rows);
+    for (int row = 0; row < rows; ++row) {
+        for (int s = 0; s < qjl_dim; ++s) {
+            h_S[static_cast<std::size_t>(row) * qjl_dim + s] =
+                gaussian_from_hash(seed, static_cast<std::uint32_t>(s),
+                                   static_cast<std::uint32_t>(row));
+        }
+    }
+
+    QjlMatrixCacheEntry entry;
+    entry.device = device;
+    entry.rows = rows;
+    entry.qjl_dim = qjl_dim;
+    entry.seed = seed;
+    check_cuda(cudaMalloc(&entry.d_S, h_S.size() * sizeof(float)), "cudaMalloc QJL matrix S");
+    check_cuda(cudaMemcpy(entry.d_S, h_S.data(), h_S.size() * sizeof(float), cudaMemcpyHostToDevice),
+               "cudaMemcpy QJL matrix S");
+    cache.push_back(entry);
+    return cache.back().d_S;
+}
+
+QjlScratchCacheEntry& get_qjl_scratch(
+    int rows,
+    int cols,
+    int qjl_dim,
+    bool need_reconstructed,
+    bool need_residual) {
+    int device = 0;
+    check_cuda(cudaGetDevice(&device), "cudaGetDevice QJL scratch cache");
+    auto& cache = qjl_scratch_cache();
+    for (auto& entry : cache) {
+        if (entry.device == device) {
+            reserve_float_buffer(
+                entry.d_projection, entry.projection_count,
+                static_cast<std::size_t>(qjl_dim) * cols,
+                "cudaMalloc QJL projection scratch");
+            reserve_float_buffer(
+                entry.d_signs_float, entry.signs_float_count,
+                static_cast<std::size_t>(qjl_dim) * cols,
+                "cudaMalloc QJL sign float scratch");
+            reserve_float_buffer(
+                entry.d_residual_hat, entry.residual_hat_count,
+                static_cast<std::size_t>(rows) * cols,
+                "cudaMalloc QJL residual reconstruction scratch");
+            if (need_reconstructed) {
+                reserve_float_buffer(
+                    entry.d_reconstructed, entry.reconstructed_count,
+                    static_cast<std::size_t>(rows) * cols,
+                    "cudaMalloc QJL MSE reconstruction scratch");
+            }
+            if (need_residual) {
+                reserve_float_buffer(
+                    entry.d_residual, entry.residual_count,
+                    static_cast<std::size_t>(rows) * cols,
+                    "cudaMalloc QJL residual scratch");
+            }
+            return entry;
+        }
+    }
+
+    QjlScratchCacheEntry entry;
+    entry.device = device;
+    cache.push_back(entry);
+    return get_qjl_scratch(rows, cols, qjl_dim, need_reconstructed, need_residual);
+}
+
+cublasHandle_t get_cached_cublas_handle(cudaStream_t stream) {
+    int device = 0;
+    check_cuda(cudaGetDevice(&device), "cudaGetDevice QJL cuBLAS handle cache");
+    auto& cache = cublas_handle_cache();
+    for (auto& entry : cache) {
+        if (entry.device == device) {
+            check_cublas(cublasSetStream(entry.handle, stream), "cublasSetStream QJL");
+            return entry.handle;
+        }
+    }
+
+    CublasHandleCacheEntry entry;
+    entry.device = device;
+    check_cublas(cublasCreate(&entry.handle), "cublasCreate QJL");
+    check_cublas(cublasSetStream(entry.handle, stream), "cublasSetStream QJL");
+    cache.push_back(entry);
+    return cache.back().handle;
 }
 
 
@@ -489,64 +655,46 @@ __global__ void column_residual_norms_kernel(
     if (tid == 0) residual_norms[col] = sqrtf(fmaxf(smem[0], 0.0f));
 }
 
-// (README) Column-wise QJL sign sketch: 對每個 residual vector 計算 q=sign(Sr) 並以 1 bit per coordinate 打包。
-__global__ void column_qjl_pack_signs_kernel(
-    const float* residual,
+// (README) Column-wise QJL sign packing: 將 GEMM 得到的 projected = S R 正負號以 1 bit per coordinate 打包。
+__global__ void column_qjl_pack_projected_signs_kernel(
+    const float* projected,
     std::uint8_t* signs,
-    int rows,
-    int cols,
-    unsigned seed) {
-    extern __shared__ float smem[];
-    const int col = blockIdx.x;
-    const int s = blockIdx.y;
-    const int tid = threadIdx.x;
-    if (col >= cols || s >= rows) return;
-    float sum = 0.0f;
-    for (int row = tid; row < rows; row += blockDim.x) {
-        sum += gaussian_from_hash(seed, static_cast<std::uint32_t>(s),
-                                  static_cast<std::uint32_t>(row)) *
-               residual[static_cast<std::size_t>(col) * rows + row];
-    }
-    smem[tid] = sum;
-    __syncthreads();
-    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-        if (tid < stride) smem[tid] += smem[tid + stride];
-        __syncthreads();
-    }
-    if (tid == 0) {
-        bitpack_write_code(
-            signs,
-            static_cast<std::size_t>(col) * rows + s,
-            1,
-            smem[0] >= 0.0f ? 1 : 0);
-    }
+    int qjl_dim,
+    int cols) {
+    const std::size_t idx = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const std::size_t total = static_cast<std::size_t>(qjl_dim) * cols;
+    if (idx >= total) return;
+    bitpack_write_code(signs, idx, 1, projected[idx] >= 0.0f ? 1 : 0);
 }
 
-// (README) Column-wise QJL residual 重建: 用 sqrt(pi/2)/d * ||r|| * S^T sign(Sr) 近似補回 residual。
-__global__ void column_qjl_reconstruct_add_kernel(
-    float* values,
+// (README) Column-wise QJL sign unpacking: 將 packed sign bits 展開成 GEMM 可使用的 dense {-1,+1} matrix。
+__global__ void column_qjl_unpack_signs_to_float_kernel(
     const std::uint8_t* signs,
+    float* signs_float,
+    int qjl_dim,
+    int cols) {
+    const std::size_t idx = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const std::size_t total = static_cast<std::size_t>(qjl_dim) * cols;
+    if (idx >= total) return;
+    signs_float[idx] = bitpack_read_code(signs, idx, 1) ? 1.0f : -1.0f;
+}
+
+// (README) Column-wise QJL residual rescale: 將 GEMM 得到的 S^T q 乘上 sqrt(pi/2)/qjl_dim 與 residual norm 後補回 accumulator。
+__global__ void column_qjl_scale_residual_add_kernel(
+    float* values,
+    const float* residual_hat,
     const float* residual_norms,
     int rows,
     int cols,
+    int qjl_dim,
     float alpha,
-    unsigned seed) {
+    float base_coeff) {
     const std::size_t idx = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     const std::size_t total = static_cast<std::size_t>(rows) * cols;
     if (idx >= total) return;
-    const int row = static_cast<int>(idx % static_cast<std::size_t>(rows));
     const int col = static_cast<int>(idx / static_cast<std::size_t>(rows));
-    float accum = 0.0f;
-    for (int s = 0; s < rows; ++s) {
-        const int sign_code = bitpack_read_code(signs, static_cast<std::size_t>(col) * rows + s, 1);
-        const float sign = sign_code ? 1.0f : -1.0f;
-        accum += sign * gaussian_from_hash(seed, static_cast<std::uint32_t>(s),
-                                           static_cast<std::uint32_t>(row));
-    }
-    const float coeff =
-        alpha * residual_norms[col] * sqrtf(3.14159265358979323846f / 2.0f) /
-        static_cast<float>(rows);
-    values[idx] += coeff * accum;
+    const float coeff = alpha * base_coeff * residual_norms[col] / static_cast<float>(qjl_dim);
+    values[idx] += coeff * residual_hat[idx];
 }
 
 __global__ void scale_kernel(float* values, std::size_t count, float scale) {
@@ -616,6 +764,12 @@ void check_cuda(cudaError_t status, const char* label) {
     }
 }
 
+void check_cublas(cublasStatus_t status, const char* label) {
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        throw std::runtime_error(std::string(label) + ": cuBLAS status " + std::to_string(static_cast<int>(status)));
+    }
+}
+
 }  // namespace
 
 std::size_t CompressedBlock::value_count() const {
@@ -658,7 +812,7 @@ std::size_t DeviceCompressedBlock::payload_bytes() const {
         const std::size_t residual_norm_bytes =
             (mode == QuantizeMode::kTurboQuantQjl) ? static_cast<std::size_t>(cols) * sizeof(float) : 0;
         const std::size_t sign_bytes =
-            (mode == QuantizeMode::kTurboQuantQjl) ? lloyd_tq_sign_bytes(rows, cols) : 0;
+            (mode == QuantizeMode::kTurboQuantQjl) ? qjl_sign_bytes(rows, cols, qjl_dim) : 0;
         return code_bytes() + norm_bytes + residual_norm_bytes + sign_bytes;
     }
     return code_bytes() + sizeof(scale);
@@ -720,8 +874,10 @@ QuantizeOptions make_quantize_options(
         if (bits < 3 || bits > 8) {
             throw std::runtime_error("mode=tq-qjl requires total bits in [3, 8]; bits=2 is unsupported.");
         }
+        if (qjl_dim < 0) {
+            throw std::runtime_error("mode=tq-qjl requires qjl_dim >= 0; use 0 for vector dimension.");
+        }
         options.mode = QuantizeMode::kTurboQuantQjl;
-        options.qjl_dim = 0;
         return options;
     }
     throw std::runtime_error("Unsupported quantization mode: " + mode);
@@ -1034,7 +1190,7 @@ std::size_t device_norm_bytes(int rows, int cols, const QuantizeOptions& options
 std::size_t device_qjl_sign_bytes(int rows, int cols, const QuantizeOptions& options) {
     if (options.mode != QuantizeMode::kTurboQuantQjl) return 0;
     validate_column_tq_options(rows, cols, options, "device_qjl_sign_bytes");
-    return lloyd_tq_sign_bytes(rows, cols);
+    return qjl_sign_bytes(rows, cols, effective_qjl_dim(rows, options));
 }
 
 // (README) Column-wise TQ 符號預產生: 預先建立每個 column/padded row 的 D 符號矩陣以便重複使用。
@@ -1188,6 +1344,7 @@ DeviceCompressedBlock quantize_fp32_device_column_tq_to_device_payload(
     }
 
     const int mse_bits = tq_mse_bits_for_options(options);
+    const int qjl_dim = effective_qjl_dim(rows, options);
     const std::size_t count = static_cast<std::size_t>(rows) * cols;
 
     DeviceCompressedBlock block;
@@ -1195,7 +1352,7 @@ DeviceCompressedBlock quantize_fp32_device_column_tq_to_device_payload(
     block.cols = cols;
     block.bits = options.bits;
     block.mode = options.mode;
-    block.qjl_dim = (options.mode == QuantizeMode::kTurboQuantQjl) ? rows : 0;
+    block.qjl_dim = qjl_dim;
     block.qjl_alpha = (options.mode == QuantizeMode::kTurboQuantQjl) ? options.qjl_alpha : 0.0f;
     block.seed = options.seed;
     block.padded_count = static_cast<int>(count);
@@ -1217,7 +1374,7 @@ DeviceCompressedBlock quantize_fp32_device_column_tq_to_device_payload(
     check_cuda(cudaMemsetAsync(d_codes, 0, block.code_bytes(), stream),
                "cudaMemsetAsync column TQ Lloyd-Max codes");
     if (options.mode == QuantizeMode::kTurboQuantQjl) {
-        check_cuda(cudaMemsetAsync(d_qjl_signs, 0, lloyd_tq_sign_bytes(rows, cols), stream),
+        check_cuda(cudaMemsetAsync(d_qjl_signs, 0, qjl_sign_bytes(rows, cols, qjl_dim), stream),
                    "cudaMemsetAsync column tq-qjl signs");
     }
     column_norms_kernel<<<cols, threads, threads * sizeof(float), stream>>>(
@@ -1231,18 +1388,10 @@ DeviceCompressedBlock quantize_fp32_device_column_tq_to_device_payload(
         d_work, d_codes, rows, cols, mse_bits);
     check_cuda(cudaGetLastError(), "launch column TQ Lloyd-Max quantize kernel");
 
-    float* d_reconstructed = nullptr;
-    bool d_reconstructed_owned = false;
-    float* d_residual = nullptr;
-    bool d_residual_owned = false;
     if (options.mode == QuantizeMode::kTurboQuantQjl) {
-        if (d_qjl_reconstructed_ext) {
-            d_reconstructed = d_qjl_reconstructed_ext;
-        } else {
-            check_cuda(cudaMalloc(&d_reconstructed, count * sizeof(float)),
-                       "cudaMalloc column tq-qjl reconstructed scratch");
-            d_reconstructed_owned = true;
-        }
+        QjlScratchCacheEntry& qjl_scratch = get_qjl_scratch(rows, cols, qjl_dim, !d_qjl_reconstructed_ext, !d_qjl_residual_ext);
+        float* d_reconstructed = d_qjl_reconstructed_ext ? d_qjl_reconstructed_ext : qjl_scratch.d_reconstructed;
+        float* d_residual = d_qjl_residual_ext ? d_qjl_residual_ext : qjl_scratch.d_residual;
         column_tq_lloyd_dequantize_kernel<<<blocks, threads, 0, stream>>>(
             d_codes, d_work, rows, cols, mse_bits);
         check_cuda(cudaGetLastError(), "launch column tq-qjl MSE centroid decode kernel");
@@ -1251,29 +1400,41 @@ DeviceCompressedBlock quantize_fp32_device_column_tq_to_device_payload(
             d_work, d_norms, d_reconstructed, rows, cols, options.seed);
         check_cuda(cudaGetLastError(), "launch column tq-qjl MSE inverse/store kernel");
 
-        if (d_qjl_residual_ext) {
-            d_residual = d_qjl_residual_ext;
-        } else {
-            check_cuda(cudaMalloc(&d_residual, count * sizeof(float)),
-                       "cudaMalloc column tq-qjl residual");
-            d_residual_owned = true;
-        }
         residual_kernel<<<blocks, threads, 0, stream>>>(
             d_values, d_reconstructed, d_residual, count);
         check_cuda(cudaGetLastError(), "launch column tq-qjl residual kernel");
         column_residual_norms_kernel<<<cols, threads, threads * sizeof(float), stream>>>(
             d_residual, block.d_residual_norms, rows, cols);
         check_cuda(cudaGetLastError(), "launch column tq-qjl residual norm kernel");
-        dim3 qjl_grid(cols, rows);
-        column_qjl_pack_signs_kernel<<<qjl_grid, threads, threads * sizeof(float), stream>>>(
-            d_residual, d_qjl_signs, rows, cols, options.seed + 17U);
+
+        float* d_S = get_qjl_matrix_device(rows, qjl_dim, options.seed + 17U);
+        cublasHandle_t handle = get_cached_cublas_handle(stream);
+        const float gemm_alpha = 1.0f;
+        const float gemm_beta = 0.0f;
+        check_cublas(cublasSgemm(
+                         handle,
+                         CUBLAS_OP_N,
+                         CUBLAS_OP_N,
+                         qjl_dim,
+                         cols,
+                         rows,
+                         &gemm_alpha,
+                         d_S,
+                         qjl_dim,
+                         d_residual,
+                         rows,
+                         &gemm_beta,
+                         qjl_scratch.d_projection,
+                         qjl_dim),
+                     "cublasSgemm QJL projection S*R");
+        int qjl_blocks = static_cast<int>(((static_cast<std::size_t>(qjl_dim) * cols) + threads - 1) / threads);
+        column_qjl_pack_projected_signs_kernel<<<qjl_blocks, threads, 0, stream>>>(
+            qjl_scratch.d_projection, d_qjl_signs, qjl_dim, cols);
         check_cuda(cudaGetLastError(), "launch column tq-qjl packed sign kernel");
     }
 
     check_cuda(cudaStreamSynchronize(stream), "cudaStreamSynchronize column TQ quantization");
 
-    if (d_residual_owned)     cudaFree(d_residual);
-    if (d_reconstructed_owned) cudaFree(d_reconstructed);
     if (!d_external_work) cudaFree(d_work);
     return block;
 }
@@ -1436,16 +1597,53 @@ void dequantize_column_tq_payload_add_to_fp32(
         if (!block.d_qjl_signs) {
             throw std::runtime_error("Column tq-qjl payload decode requires qjl signs.");
         }
+        if (block.qjl_dim <= 0) {
+            throw std::runtime_error("Column tq-qjl payload decode requires positive qjl_dim.");
+        }
         const float* residual_norms = block.d_residual_norms ?
             block.d_residual_norms : (block.d_norms + block.cols);
-        column_qjl_reconstruct_add_kernel<<<blocks, threads, 0, stream>>>(
-            d_accumulator,
+
+        QjlScratchCacheEntry& qjl_scratch = get_qjl_scratch(block.rows, block.cols, block.qjl_dim, false, false);
+        const std::size_t sign_count = static_cast<std::size_t>(block.qjl_dim) * block.cols;
+        int qjl_blocks = static_cast<int>((sign_count + threads - 1) / threads);
+        column_qjl_unpack_signs_to_float_kernel<<<qjl_blocks, threads, 0, stream>>>(
             block.d_qjl_signs,
+            qjl_scratch.d_signs_float,
+            block.qjl_dim,
+            block.cols);
+        check_cuda(cudaGetLastError(), "launch column tq-qjl sign unpack kernel");
+
+        float* d_S = get_qjl_matrix_device(block.rows, block.qjl_dim, block.seed + 17U);
+        cublasHandle_t handle = get_cached_cublas_handle(stream);
+        const float gemm_alpha = 1.0f;
+        const float gemm_beta = 0.0f;
+        check_cublas(cublasSgemm(
+                         handle,
+                         CUBLAS_OP_T,
+                         CUBLAS_OP_N,
+                         block.rows,
+                         block.cols,
+                         block.qjl_dim,
+                         &gemm_alpha,
+                         d_S,
+                         block.qjl_dim,
+                         qjl_scratch.d_signs_float,
+                         block.qjl_dim,
+                         &gemm_beta,
+                         qjl_scratch.d_residual_hat,
+                         block.rows),
+                     "cublasSgemm QJL reconstruction S^T*q");
+
+        constexpr float kSqrtPiOverTwo = 1.25331413731550025121f;
+        column_qjl_scale_residual_add_kernel<<<blocks, threads, 0, stream>>>(
+            d_accumulator,
+            qjl_scratch.d_residual_hat,
             residual_norms,
             block.rows,
             block.cols,
+            block.qjl_dim,
             block.qjl_alpha,
-            block.seed + 17U);
+            kSqrtPiOverTwo);
         check_cuda(cudaGetLastError(), "launch column tq-qjl residual reconstruction add kernel");
     }
     check_cuda(cudaStreamSynchronize(stream), "cudaStreamSynchronize column TQ payload add decode");
