@@ -39,7 +39,30 @@ Notes:
 - Use `p=0.6` as the first-pass stress test.
 - `p=1.0` is an easy sanity check, not enough by itself.
 - `B Relative Error` is optional; enable only with `--check-b-error` when diagnosing compression damage.
-- After B-only TQ experiments, decide whether to apply TQ to subspace iteration `Z = sum_i A_i^T Q_i`.
+- TQ is now available for both B-side reduce and subspace iteration communication.
+- Keep B-only TQ as the first experiment so we have a clean baseline before enabling subspace-side compression.
+
+Follow-up: validate TQ on subspace iteration / power iteration communication.
+
+- Target communication path:
+  ```text
+  Y = A A^T A Omega
+  ```
+- In the distributed implementation, this mainly means investigating the intermediate reduce/broadcast path such as:
+  ```text
+  Z = sum_i A_i^T Q_i
+  Y_i = A_i Z
+  ```
+- Motivation: after enabling subspace iteration, this communication can become comparable to `B` reduce, so B-only TQ may no longer address the dominant communication cost.
+- Risk: quantizing the subspace iteration intermediate may amplify basis error across power iterations, so evaluate accuracy using `Final Reconstruction Error` and `Error Ratio`, not only runtime.
+- Suggested experiment:
+  ```text
+  none
+  B-only TQ
+  subspace-only TQ
+  B + subspace TQ
+  ```
+  with `subspace_iter = 1` first, then optionally `subspace_iter = 2`.
 
 
 

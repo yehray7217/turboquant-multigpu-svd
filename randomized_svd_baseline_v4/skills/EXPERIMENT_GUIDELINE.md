@@ -229,19 +229,29 @@ subspace-iter = 1
 repeat = 50
 ```
 
-Compare:
+Initial B-only comparison:
 
-| Group | `compress-b-mode` | `compress-b-bits` |
-|---|---|---:|
-| control | `none` | `0` |
-| TQ 4-bit | `tq` | `4` |
-| TQ 2-bit | `tq` | `2` |
+| Group | `compress-b-mode` | `compress-b-bits` | `compress-subspace-mode` | `compress-subspace-bits` |
+|---|---|---:|---|---:|
+| control | `none` | `0` | `none` | `0` |
+| B-only TQ 4-bit | `tq` | `4` | `none` | `0` |
+| B-only TQ 2-bit | `tq` | `2` | `none` | `0` |
+
+Follow-up subspace-side comparison:
+
+| Group | `compress-b-mode` | `compress-b-bits` | `compress-subspace-mode` | `compress-subspace-bits` |
+|---|---|---:|---|---:|
+| control | `none` | `0` | `none` | `0` |
+| subspace-only TQ 4-bit | `none` | `0` | `tq` | `4` |
+| B + subspace TQ 4-bit | `tq` | `4` | `tq` | `4` |
+| B + subspace TQ 2-bit | `tq` | `2` | `tq` | `2` |
 
 Expected interpretation:
 
 - TQ 4-bit is likely the best tradeoff.
 - TQ 2-bit may be faster but can damage accuracy.
-- With `subspace-iter = 1`, B-only TQ may not produce full speedup because the subspace iteration `Z` reduce is still uncompressed.
+- With `subspace-iter = 1`, B-only TQ may not produce full speedup because the subspace iteration `Z` communication can be comparable to the `B` reduce.
+- Use `compress-subspace-*` only when explicitly studying subspace-side compression.
 - Start with `p=0.6`; if time allows, sweep `p=0.4, 0.6, 0.8, 1.0`.
 
 ## 7. Recommended Subspace Iteration Settings
@@ -311,6 +321,8 @@ BASE_ARGS=(
     --skip-form-u
     --compress-b-mode none
     --compress-b-bits 0
+    --compress-subspace-mode none
+    --compress-subspace-bits 0
     --summary-only
 )
 

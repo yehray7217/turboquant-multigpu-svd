@@ -9,6 +9,9 @@ test*.png
 test*.jpg
 test*.webp
 
+.build
+.debug
+
 *.out
 *.err
 

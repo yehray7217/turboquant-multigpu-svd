@@ -56,6 +56,7 @@ struct DeviceCompressedBlock {
     unsigned seed = 1234;
     QuantizeMode mode = QuantizeMode::kNone;
     std::uint8_t* d_codes = nullptr;
+    float* d_norms = nullptr;
     int* d_qjl_signs = nullptr;
 
     std::size_t value_count() const;
@@ -130,6 +131,7 @@ DeviceCompressedBlock quantize_fp32_device_column_tq_to_device_payload(
     int cols,
     const QuantizeOptions& options,
     std::uint8_t* d_codes,
+    float* d_norms = nullptr,
     float* d_work = nullptr,
     const signed char* d_signs = nullptr,
     int* d_qjl_signs = nullptr,
@@ -139,6 +141,35 @@ DeviceCompressedBlock quantize_fp32_device_column_tq_to_device_payload(
     float* d_qjl_residual = nullptr,      // size: rows * cols floats
     float* d_qjl_partials = nullptr,      // size: qjl_dim * kQjlColumnBlocksPerSketch floats
     cudaStream_t stream = 0);
+
+inline DeviceCompressedBlock quantize_fp32_device_column_tq_to_device_payload(
+    const float* d_values,
+    int rows,
+    int cols,
+    const QuantizeOptions& options,
+    std::uint8_t* d_codes,
+    float* d_work,
+    const signed char* d_signs,
+    int* d_qjl_signs,
+    float* d_qjl_reconstructed = nullptr,
+    float* d_qjl_residual = nullptr,
+    float* d_qjl_partials = nullptr,
+    cudaStream_t stream = 0) {
+    return quantize_fp32_device_column_tq_to_device_payload(
+        d_values,
+        rows,
+        cols,
+        options,
+        d_codes,
+        nullptr,
+        d_work,
+        d_signs,
+        d_qjl_signs,
+        d_qjl_reconstructed,
+        d_qjl_residual,
+        d_qjl_partials,
+        stream);
+}
 
 void dequantize_device_payload_to_fp32(
     const DeviceCompressedBlock& block,

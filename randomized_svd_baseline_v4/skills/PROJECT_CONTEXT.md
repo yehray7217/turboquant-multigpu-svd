@@ -328,6 +328,8 @@ Current useful CLI options:
 --gpus-per-rank
 --compress-b-mode none|lowbit|tq|tq-qjl
 --compress-b-bits 0|2|4|8
+--compress-subspace-mode none|lowbit|tq|tq-qjl
+--compress-subspace-bits 0|2|4|8
 --qjl-dim
 --qjl-alpha
 --device-random-input
@@ -380,9 +382,9 @@ randomized_svd_baseline_v4/
 
 ## 9. Main Next Steps
 
-### 9.1 Apply TurboQuant to Subspace Iteration Communication
+### 9.1 Validate TurboQuant on Subspace Iteration Communication
 
-Now that subspace iteration is implemented, there is a new communication-heavy matrix:
+Subspace iteration TQ is now implemented behind explicit CLI flags. The communication-heavy matrix is:
 
 ```text
 Z = sum_i A_i^T Q_i
@@ -400,13 +402,23 @@ This is the same asymptotic size as:
 B = sum_i Q_i^T A_i
 ```
 
-Therefore, if `--subspace-iter` is enabled, compressing only `B_i` leaves a major communication cost untouched. A natural next implementation step is to apply TQ to the subspace iteration `Z` reduce path as well.
+Therefore, if `--subspace-iter` is enabled, compressing only `B_i` leaves a major communication cost untouched. The implementation now supports compressing this `Z` path through:
 
-Questions to answer:
+```text
+--compress-subspace-mode tq
+--compress-subspace-bits 4
+```
 
-- Can the existing column-wise TQ kernels be reused for `Z`?
-- Should `Z_i` be compressed before MPI allreduce/gather, then decoded and accumulated?
+Implementation note:
+
+```text
+Each MPI rank compresses its local Z contribution, all ranks exchange compressed payloads, and each rank decodes/accumulates the global Z on GPU0 before computing Y_i = A_i Z.
+```
+
+Questions to answer experimentally:
+
 - What is the effect on final reconstruction error?
+- How much runtime is saved versus the added encode/decode cost?
 - Does q=1 + TQ on both `Z` and `B` give a better speed/accuracy tradeoff than q=0 + TQ only on `B`?
 
 ### 9.2 Run TurboQuant Experiments on v4 Synthetic Spectra
@@ -438,9 +450,21 @@ Use `0.6` as the first-pass stress-test config. Keep `1.0` as an easier sanity c
 Compare:
 
 ```text
-compress-b-mode = none
-compress-b-mode = tq, compress-b-bits = 4
-compress-b-mode = tq, compress-b-bits = 2
+control:
+  compress-b-mode = none
+  compress-subspace-mode = none
+
+B-only TQ:
+  compress-b-mode = tq, compress-b-bits = 4 or 2
+  compress-subspace-mode = none
+
+subspace-only TQ:
+  compress-b-mode = none
+  compress-subspace-mode = tq, compress-subspace-bits = 4
+
+B + subspace TQ:
+  compress-b-mode = tq, compress-b-bits = 4 or 2
+  compress-subspace-mode = tq, compress-subspace-bits = 4 or 2
 ```
 
 Metrics to record:
@@ -455,7 +479,7 @@ Suggested interpretation:
 
 - TQ 4-bit is expected to be the useful tradeoff.
 - TQ 2-bit is expected to be faster but may damage accuracy heavily.
-- If q=1 is used, B-only compression may not show the full possible speedup because subspace iteration `Z` communication remains uncompressed.
+- If q=1 is used, B-only compression may not show the full possible speedup because subspace iteration `Z` communication can be comparable to the `B` reduce.
 
 ## 10. Known Issues / Open Questions
 
