@@ -1,0 +1,132 @@
+=====================================
+REPORT: ncu_reports/decode_add_942924.ncu-rep
+=====================================
+Full details: ncu_text_summaries/decode_add_942924_details.txt
+
+    Section: Memory Workload Analysis
+    Memory Throughput     Gbyte/s       413.91
+    Mem Busy                    %        64.35
+    Max Bandwidth               %        52.35
+    L1/TEX Hit Rate             %        63.45
+    L2 Hit Rate                 %        50.67
+    Warp Cycles Per Issued Instruction             cycle        20.44
+    Warp Cycles Per Executed Instruction           cycle        20.46
+    Avg. Active Threads Per Warp                                   32
+    Avg. Not Predicated Off Threads Per Warp                    30.78
+          On average, each warp of this workload spends 6.2 cycles being stalled waiting for a scoreboard dependency on 
+          used data to shared memory. This stall type represents about 30.4% of the total average of 20.4 cycles        
+    INF   Check the Warp Stall Sampling (All Samples) table for the top stall locations in your source based on         
+          on each stall reason.                                                                                         
+    Section: Launch Statistics
+    Block Size                                                   256
+    Grid Size                                                  16384
+    Registers Per Thread             register/thread              22
+    Shared Memory Configuration Size           Kbyte            8.19
+    Driver Shared Memory Per Block        byte/block               0
+    Dynamic Shared Memory Per Block       byte/block               0
+    Static Shared Memory Per Block       Kbyte/block            1.02
+    Waves Per SM                                               25.60
+    Section: Occupancy
+    Theoretical Occupancy                     %          100
+    Achieved Occupancy                        %        92.45
+
+=====================================
+REPORT: ncu_reports/fused_fwht256_942924.ncu-rep
+=====================================
+Full details: ncu_text_summaries/fused_fwht256_942924_details.txt
+
+    Section: Memory Workload Analysis
+    Memory Throughput     Gbyte/s       439.90
+    Mem Busy                    %        68.13
+    Max Bandwidth               %        54.62
+    L1/TEX Hit Rate             %         9.72
+    L2 Hit Rate                 %        50.70
+    Warp Cycles Per Issued Instruction             cycle        23.56
+    Warp Cycles Per Executed Instruction           cycle        23.58
+    Avg. Active Threads Per Warp                                   32
+    Avg. Not Predicated Off Threads Per Warp                    31.54
+          On average, each warp of this workload spends 8.3 cycles being stalled waiting for a scoreboard dependency on 
+          used data to shared memory. This stall type represents about 35.1% of the total average of 23.6 cycles        
+    INF   Check the Warp Stall Sampling (All Samples) table for the top stall locations in your source based on         
+          on each stall reason.                                                                                         
+    Section: Launch Statistics
+    Block Size                                                   256
+    Grid Size                                                  16384
+    Registers Per Thread             register/thread              18
+    Shared Memory Configuration Size           Kbyte            8.19
+    Driver Shared Memory Per Block        byte/block               0
+    Dynamic Shared Memory Per Block       byte/block               0
+    Static Shared Memory Per Block       Kbyte/block            1.02
+    Waves Per SM                                               25.60
+    Section: Occupancy
+    Theoretical Occupancy                     %          100
+    Achieved Occupancy                        %        92.53
+
+=====================================
+REPORT: ncu_reports/norm_942924.ncu-rep
+=====================================
+Full details: ncu_text_summaries/norm_942924_details.txt
+
+    Section: Memory Workload Analysis
+    Memory Throughput     Gbyte/s       343.96
+    Mem Busy                    %        76.88
+    Max Bandwidth               %        68.26
+    L1/TEX Hit Rate             %         0.08
+    L2 Hit Rate                 %         3.11
+    Warp Cycles Per Issued Instruction             cycle        17.70
+    Warp Cycles Per Executed Instruction           cycle        17.71
+    Avg. Active Threads Per Warp                                31.56
+    Avg. Not Predicated Off Threads Per Warp                    20.69
+          Instructions are executed in warps, which are groups of 32 threads. Optimal instruction throughput is         
+          thread completion, and divergent flow control can significantly lower the number of active threads in a warp  
+          to 20.7 threads per warp due to predication. The compiler may use predication to avoid an actual branch.      
+    Section: Launch Statistics
+    Block Size                                                   256
+    Grid Size                                                  16384
+    Registers Per Thread             register/thread              16
+    Shared Memory Configuration Size           Kbyte            8.19
+    Driver Shared Memory Per Block        byte/block               0
+    Dynamic Shared Memory Per Block      Kbyte/block            1.02
+    Static Shared Memory Per Block        byte/block               0
+    Waves Per SM                                               25.60
+    Section: Occupancy
+    Theoretical Occupancy                     %          100
+    Achieved Occupancy                        %        86.34
+          The difference between calculated theoretical (100.0%) and measured achieved occupancy (86.3%) can be the     
+          Guide (https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#occupancy) for more details on     
+          optimizing occupancy.                                                                                         
+
+=====================================
+REPORT: ncu_reports/quantize_bitpack_942924.ncu-rep
+=====================================
+Full details: ncu_text_summaries/quantize_bitpack_942924_details.txt
+
+    Section: Memory Workload Analysis
+    Memory Throughput     Gbyte/s       223.47
+    Mem Busy                    %        56.24
+    Max Bandwidth               %        45.49
+    L1/TEX Hit Rate             %        56.87
+    L2 Hit Rate                 %        64.60
+    Warp Cycles Per Issued Instruction             cycle        17.82
+    Warp Cycles Per Executed Instruction           cycle        17.86
+    Avg. Active Threads Per Warp                                21.24
+    Avg. Not Predicated Off Threads Per Warp                    17.87
+          Instructions are executed in warps, which are groups of 32 threads. Optimal instruction throughput is         
+          thread completion, and divergent flow control can significantly lower the number of active threads in a warp  
+          to 17.9 threads per warp due to predication. The compiler may use predication to avoid an actual branch.      
+    Section: Launch Statistics
+    Block Size                                                   256
+    Grid Size                                                  16384
+    Registers Per Thread             register/thread              16
+    Shared Memory Configuration Size            byte               0
+    Driver Shared Memory Per Block        byte/block               0
+    Dynamic Shared Memory Per Block       byte/block               0
+    Static Shared Memory Per Block        byte/block               0
+    Waves Per SM                                               25.60
+    Section: Occupancy
+    Theoretical Occupancy                     %          100
+    Achieved Occupancy                        %        88.60
+          The difference between calculated theoretical (100.0%) and measured achieved occupancy (88.6%) can be the     
+          Guide (https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#occupancy) for more details on     
+          optimizing occupancy.                                                                                         
+

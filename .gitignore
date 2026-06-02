@@ -12,8 +12,8 @@ test*.webp
 randomized_svd_baseline_v4/.build/*
 randomized_svd_baseline_v4/.debug/*
 
-*.out
-*.err
+.build/
+*.ncu-rep
 
 cusolver/cusolver
 cusolver/*_%j.out

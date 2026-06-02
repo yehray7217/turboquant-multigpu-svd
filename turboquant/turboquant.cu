@@ -234,6 +234,18 @@ __device__ int lloyd_tq_bucket(float value, int dim, int bits) {
     return levels - 1;
 }
 
+__device__ int lloyd_tq_bucket_branchless4(float value, int dim) {
+    const TQDeviceCodebook codebook = get_tq_codebook_device(dim, 4);
+    const float* boundaries = codebook.boundaries;
+    if (!boundaries || codebook.levels != 16 || isnan(value)) return 0;
+    int code = 0;
+#pragma unroll
+    for (int i = 1; i < 16; ++i) {
+        code += (value >= boundaries[i]) ? 1 : 0;
+    }
+    return code;
+}
+
 __device__ void bitpack_write_code(std::uint8_t* packed, std::size_t idx, int bits, int code) {
     unsigned int* words = reinterpret_cast<unsigned int*>(packed);
     const std::size_t bit_offset = idx * static_cast<std::size_t>(bits);
@@ -567,6 +579,35 @@ __global__ void column_tq_normalize_sign_kernel(
         rademacher(seed, static_cast<std::uint32_t>(row), static_cast<std::uint32_t>(col));
 }
 
+__global__ void column_tq_normalize_sign_fwht256_kernel(
+    const float* values,
+    const float* norms,
+    float* work,
+    int cols,
+    unsigned seed,
+    float eps) {
+    __shared__ float smem[256];
+    const int row = threadIdx.x;
+    const int col = blockIdx.x;
+    if (row >= 256 || col >= cols) return;
+
+    const std::size_t idx = static_cast<std::size_t>(col) * 256 + row;
+    const float inv_norm = 1.0f / (norms[col] + eps);
+    smem[row] = values[idx] * inv_norm *
+        rademacher(seed, static_cast<std::uint32_t>(row), static_cast<std::uint32_t>(col));
+    __syncthreads();
+
+    for (int len = 1; len < 256; len <<= 1) {
+        const float a = smem[row];
+        const float b = smem[row ^ len];
+        __syncthreads();
+        smem[row] = (row & len) ? (b - a) : (a + b);
+        __syncthreads();
+    }
+
+    work[idx] = smem[row] * 0.0625f;
+}
+
 // (README) Column-wise Lloyd-Max bucket 壓縮: 將 RHT 後的 coordinate 查 codebook bucket 並 bit-pack。
 __global__ void column_tq_lloyd_quantize_kernel(
     const float* transformed,
@@ -577,8 +618,56 @@ __global__ void column_tq_lloyd_quantize_kernel(
     const std::size_t idx = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     const std::size_t total = static_cast<std::size_t>(rows) * cols;
     if (idx >= total) return;
-    const int code = lloyd_tq_bucket(transformed[idx], rows, bits);
+    const int code = (bits == 4) ?
+        lloyd_tq_bucket_branchless4(transformed[idx], rows) :
+        lloyd_tq_bucket(transformed[idx], rows, bits);
     bitpack_write_code(codes, idx, bits, code);
+}
+
+__global__ void column_tq4_lloyd_quantize_branchless_alt_kernel(
+    const float* transformed,
+    std::uint8_t* codes,
+    int rows,
+    int cols) {
+    const std::size_t idx = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const std::size_t total = static_cast<std::size_t>(rows) * cols;
+    if (idx >= total) return;
+    const int code = lloyd_tq_bucket_branchless4(transformed[idx], rows);
+    bitpack_write_code(codes, idx, 4, code);
+}
+
+__global__ void column_tq4_lloyd_quantize_pack4_alt_kernel(
+    const float* transformed,
+    std::uint8_t* codes,
+    int rows,
+    int cols) {
+    const std::size_t pair_idx = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const std::size_t count = static_cast<std::size_t>(rows) * cols;
+    const std::size_t idx0 = pair_idx * 2;
+    if (idx0 >= count) return;
+    const int code0 = lloyd_tq_bucket(transformed[idx0], rows, 4);
+    int code1 = 0;
+    if (idx0 + 1 < count) {
+        code1 = lloyd_tq_bucket(transformed[idx0 + 1], rows, 4);
+    }
+    codes[pair_idx] = static_cast<std::uint8_t>((code0 & 0x0f) | ((code1 & 0x0f) << 4));
+}
+
+__global__ void column_tq4_lloyd_quantize_pack4_branchless_alt_kernel(
+    const float* transformed,
+    std::uint8_t* codes,
+    int rows,
+    int cols) {
+    const std::size_t pair_idx = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const std::size_t count = static_cast<std::size_t>(rows) * cols;
+    const std::size_t idx0 = pair_idx * 2;
+    if (idx0 >= count) return;
+    const int code0 = lloyd_tq_bucket_branchless4(transformed[idx0], rows);
+    int code1 = 0;
+    if (idx0 + 1 < count) {
+        code1 = lloyd_tq_bucket_branchless4(transformed[idx0 + 1], rows);
+    }
+    codes[pair_idx] = static_cast<std::uint8_t>((code0 & 0x0f) | ((code1 & 0x0f) << 4));
 }
 
 // (README) Column-wise Lloyd-Max centroid 解碼: 將 bit-packed bucket index 查回 rotated-domain centroid。
@@ -614,6 +703,37 @@ __global__ void column_tq_apply_sign_norm_add_kernel(
         rademacher(seed, static_cast<std::uint32_t>(row), static_cast<std::uint32_t>(col));
 }
 
+__global__ void column_tq_lloyd_dequantize_fwht256_apply_add_kernel(
+    const std::uint8_t* codes,
+    const float* norms,
+    float* values,
+    int cols,
+    int bits,
+    unsigned seed) {
+    __shared__ float smem[256];
+    const int row = threadIdx.x;
+    const int col = blockIdx.x;
+    if (row >= 256 || col >= cols) return;
+
+    const std::size_t idx = static_cast<std::size_t>(col) * 256 + row;
+    const int code = bitpack_read_code(codes, idx, bits);
+    const TQDeviceCodebook codebook = get_tq_codebook_device(256, bits);
+    smem[row] = (codebook.centroids && code >= 0 && code < codebook.levels) ?
+        codebook.centroids[code] : 0.0f;
+    __syncthreads();
+
+    for (int len = 1; len < 256; len <<= 1) {
+        const float a = smem[row];
+        const float b = smem[row ^ len];
+        __syncthreads();
+        smem[row] = (row & len) ? (b - a) : (a + b);
+        __syncthreads();
+    }
+
+    values[idx] += norms[col] * (smem[row] * 0.0625f) *
+        rademacher(seed, static_cast<std::uint32_t>(row), static_cast<std::uint32_t>(col));
+}
+
 // (README) Column-wise TQ 反旋轉與 rescale 儲存: inverse RHT 後乘回原 norm 與 D 符號並寫出 MSE reconstruction。
 __global__ void column_tq_apply_sign_norm_store_kernel(
     const float* work,
@@ -628,6 +748,37 @@ __global__ void column_tq_apply_sign_norm_store_kernel(
     const int row = static_cast<int>(idx % static_cast<std::size_t>(rows));
     const int col = static_cast<int>(idx / static_cast<std::size_t>(rows));
     values[idx] = norms[col] * work[idx] *
+        rademacher(seed, static_cast<std::uint32_t>(row), static_cast<std::uint32_t>(col));
+}
+
+__global__ void column_tq_lloyd_dequantize_fwht256_apply_store_kernel(
+    const std::uint8_t* codes,
+    const float* norms,
+    float* values,
+    int cols,
+    int bits,
+    unsigned seed) {
+    __shared__ float smem[256];
+    const int row = threadIdx.x;
+    const int col = blockIdx.x;
+    if (row >= 256 || col >= cols) return;
+
+    const std::size_t idx = static_cast<std::size_t>(col) * 256 + row;
+    const int code = bitpack_read_code(codes, idx, bits);
+    const TQDeviceCodebook codebook = get_tq_codebook_device(256, bits);
+    smem[row] = (codebook.centroids && code >= 0 && code < codebook.levels) ?
+        codebook.centroids[code] : 0.0f;
+    __syncthreads();
+
+    for (int len = 1; len < 256; len <<= 1) {
+        const float a = smem[row];
+        const float b = smem[row ^ len];
+        __syncthreads();
+        smem[row] = (row & len) ? (b - a) : (a + b);
+        __syncthreads();
+    }
+
+    values[idx] = norms[col] * (smem[row] * 0.0625f) *
         rademacher(seed, static_cast<std::uint32_t>(row), static_cast<std::uint32_t>(col));
 }
 
@@ -1380,10 +1531,16 @@ DeviceCompressedBlock quantize_fp32_device_column_tq_to_device_payload(
     column_norms_kernel<<<cols, threads, threads * sizeof(float), stream>>>(
         d_values, d_norms, rows, cols);
     check_cuda(cudaGetLastError(), "launch column TQ norm kernel");
-    column_tq_normalize_sign_kernel<<<blocks, threads, 0, stream>>>(
-        d_values, d_norms, d_work, rows, cols, options.seed, 1.0e-12f);
-    check_cuda(cudaGetLastError(), "launch column TQ normalize/sign kernel");
-    fwht_columns_normalized_device(d_work, rows, cols, stream);
+    if (rows == 256) {
+        column_tq_normalize_sign_fwht256_kernel<<<cols, 256, 0, stream>>>(
+            d_values, d_norms, d_work, cols, options.seed, 1.0e-12f);
+        check_cuda(cudaGetLastError(), "launch column TQ fused normalize/sign/fwht256 kernel");
+    } else {
+        column_tq_normalize_sign_kernel<<<blocks, threads, 0, stream>>>(
+            d_values, d_norms, d_work, rows, cols, options.seed, 1.0e-12f);
+        check_cuda(cudaGetLastError(), "launch column TQ normalize/sign kernel");
+        fwht_columns_normalized_device(d_work, rows, cols, stream);
+    }
     column_tq_lloyd_quantize_kernel<<<blocks, threads, 0, stream>>>(
         d_work, d_codes, rows, cols, mse_bits);
     check_cuda(cudaGetLastError(), "launch column TQ Lloyd-Max quantize kernel");
@@ -1392,13 +1549,19 @@ DeviceCompressedBlock quantize_fp32_device_column_tq_to_device_payload(
         QjlScratchCacheEntry& qjl_scratch = get_qjl_scratch(rows, cols, qjl_dim, !d_qjl_reconstructed_ext, !d_qjl_residual_ext);
         float* d_reconstructed = d_qjl_reconstructed_ext ? d_qjl_reconstructed_ext : qjl_scratch.d_reconstructed;
         float* d_residual = d_qjl_residual_ext ? d_qjl_residual_ext : qjl_scratch.d_residual;
-        column_tq_lloyd_dequantize_kernel<<<blocks, threads, 0, stream>>>(
-            d_codes, d_work, rows, cols, mse_bits);
-        check_cuda(cudaGetLastError(), "launch column tq-qjl MSE centroid decode kernel");
-        fwht_columns_normalized_device(d_work, rows, cols, stream);
-        column_tq_apply_sign_norm_store_kernel<<<blocks, threads, 0, stream>>>(
-            d_work, d_norms, d_reconstructed, rows, cols, options.seed);
-        check_cuda(cudaGetLastError(), "launch column tq-qjl MSE inverse/store kernel");
+        if (rows == 256) {
+            column_tq_lloyd_dequantize_fwht256_apply_store_kernel<<<cols, 256, 0, stream>>>(
+                d_codes, d_norms, d_reconstructed, cols, mse_bits, options.seed);
+            check_cuda(cudaGetLastError(), "launch column tq-qjl fused MSE inverse/store fwht256 kernel");
+        } else {
+            column_tq_lloyd_dequantize_kernel<<<blocks, threads, 0, stream>>>(
+                d_codes, d_work, rows, cols, mse_bits);
+            check_cuda(cudaGetLastError(), "launch column tq-qjl MSE centroid decode kernel");
+            fwht_columns_normalized_device(d_work, rows, cols, stream);
+            column_tq_apply_sign_norm_store_kernel<<<blocks, threads, 0, stream>>>(
+                d_work, d_norms, d_reconstructed, rows, cols, options.seed);
+            check_cuda(cudaGetLastError(), "launch column tq-qjl MSE inverse/store kernel");
+        }
 
         residual_kernel<<<blocks, threads, 0, stream>>>(
             d_values, d_reconstructed, d_residual, count);
@@ -1436,6 +1599,106 @@ DeviceCompressedBlock quantize_fp32_device_column_tq_to_device_payload(
     check_cuda(cudaStreamSynchronize(stream), "cudaStreamSynchronize column TQ quantization");
 
     if (!d_external_work) cudaFree(d_work);
+    return block;
+}
+
+DeviceCompressedBlock profile_tq_column_encode_to_device_payload(
+    const float* d_values,
+    int rows,
+    int cols,
+    const QuantizeOptions& options,
+    std::uint8_t* d_codes,
+    float* d_norms,
+    float* d_work,
+    TqColumnProfileTimings* timings,
+    cudaStream_t stream) {
+    if (!timings) {
+        throw std::runtime_error("TQ profile encode requires non-null timings.");
+    }
+    if (!d_values || !d_codes || !d_norms || !d_work) {
+        throw std::runtime_error("TQ profile encode received a null device pointer.");
+    }
+    if (options.mode != QuantizeMode::kTurboQuant) {
+        throw std::runtime_error("TQ profile encode only supports mode=tq.");
+    }
+    validate_column_tq_options(rows, cols, options, "TQ profile encode");
+
+    const std::size_t count = static_cast<std::size_t>(rows) * cols;
+    const int bits = tq_mse_bits_for_options(options);
+
+    DeviceCompressedBlock block;
+    block.rows = rows;
+    block.cols = cols;
+    block.bits = options.bits;
+    block.mode = options.mode;
+    block.qjl_dim = 0;
+    block.qjl_alpha = 0.0f;
+    block.seed = options.seed;
+    block.padded_count = static_cast<int>(count);
+    block.scale = 1.0f;
+    block.residual_norm = 0.0f;
+    block.d_codes = d_codes;
+    block.d_norms = d_norms;
+    block.d_residual_norms = nullptr;
+    block.d_qjl_signs = nullptr;
+
+    cudaEvent_t e_start = nullptr;
+    cudaEvent_t e_clear = nullptr;
+    cudaEvent_t e_norm = nullptr;
+    cudaEvent_t e_transform = nullptr;
+    cudaEvent_t e_quantize = nullptr;
+    check_cuda(cudaEventCreate(&e_start), "cudaEventCreate TQ profile encode start");
+    check_cuda(cudaEventCreate(&e_clear), "cudaEventCreate TQ profile encode clear");
+    check_cuda(cudaEventCreate(&e_norm), "cudaEventCreate TQ profile encode norm");
+    check_cuda(cudaEventCreate(&e_transform), "cudaEventCreate TQ profile encode transform");
+    check_cuda(cudaEventCreate(&e_quantize), "cudaEventCreate TQ profile encode quantize");
+
+    const int threads = 256;
+    const int blocks = static_cast<int>((count + threads - 1) / threads);
+
+    check_cuda(cudaEventRecord(e_start, stream), "cudaEventRecord TQ profile encode start");
+    check_cuda(cudaMemsetAsync(d_codes, 0, block.code_bytes(), stream),
+               "cudaMemsetAsync TQ profile codes");
+    check_cuda(cudaEventRecord(e_clear, stream), "cudaEventRecord TQ profile clear");
+
+    column_norms_kernel<<<cols, threads, threads * sizeof(float), stream>>>(
+        d_values, d_norms, rows, cols);
+    check_cuda(cudaGetLastError(), "launch TQ profile norm kernel");
+    check_cuda(cudaEventRecord(e_norm, stream), "cudaEventRecord TQ profile norm");
+
+    if (rows == 256) {
+        column_tq_normalize_sign_fwht256_kernel<<<cols, 256, 0, stream>>>(
+            d_values, d_norms, d_work, cols, options.seed, 1.0e-12f);
+        check_cuda(cudaGetLastError(), "launch TQ profile fused fwht256 kernel");
+    } else {
+        column_tq_normalize_sign_kernel<<<blocks, threads, 0, stream>>>(
+            d_values, d_norms, d_work, rows, cols, options.seed, 1.0e-12f);
+        check_cuda(cudaGetLastError(), "launch TQ profile normalize/sign kernel");
+        fwht_columns_normalized_device(d_work, rows, cols, stream);
+    }
+    check_cuda(cudaEventRecord(e_transform, stream), "cudaEventRecord TQ profile transform");
+
+    column_tq_lloyd_quantize_kernel<<<blocks, threads, 0, stream>>>(
+        d_work, d_codes, rows, cols, bits);
+    check_cuda(cudaGetLastError(), "launch TQ profile quantize kernel");
+    check_cuda(cudaEventRecord(e_quantize, stream), "cudaEventRecord TQ profile quantize");
+    check_cuda(cudaEventSynchronize(e_quantize), "cudaEventSynchronize TQ profile encode");
+
+    check_cuda(cudaEventElapsedTime(&timings->clear_codes_ms, e_start, e_clear),
+               "cudaEventElapsedTime TQ profile clear");
+    check_cuda(cudaEventElapsedTime(&timings->norm_ms, e_clear, e_norm),
+               "cudaEventElapsedTime TQ profile norm");
+    check_cuda(cudaEventElapsedTime(&timings->transform_ms, e_norm, e_transform),
+               "cudaEventElapsedTime TQ profile transform");
+    check_cuda(cudaEventElapsedTime(&timings->quantize_ms, e_transform, e_quantize),
+               "cudaEventElapsedTime TQ profile quantize");
+
+    cudaEventDestroy(e_start);
+    cudaEventDestroy(e_clear);
+    cudaEventDestroy(e_norm);
+    cudaEventDestroy(e_transform);
+    cudaEventDestroy(e_quantize);
+
     return block;
 }
 
@@ -1585,13 +1848,19 @@ void dequantize_column_tq_payload_add_to_fp32(
     const std::size_t count = block.value_count();
     const int threads = 256;
     int blocks = static_cast<int>((count + threads - 1) / threads);
-    column_tq_lloyd_dequantize_kernel<<<blocks, threads, 0, stream>>>(
-        block.d_codes, d_work, block.rows, block.cols, mse_bits);
-    check_cuda(cudaGetLastError(), "launch column TQ Lloyd-Max centroid decode kernel");
-    fwht_columns_normalized_device(d_work, block.rows, block.cols, stream);
-    column_tq_apply_sign_norm_add_kernel<<<blocks, threads, 0, stream>>>(
-        d_work, block.d_norms, d_accumulator, block.rows, block.cols, block.seed);
-    check_cuda(cudaGetLastError(), "launch column TQ inverse/rescale add kernel");
+    if (block.rows == 256) {
+        column_tq_lloyd_dequantize_fwht256_apply_add_kernel<<<block.cols, 256, 0, stream>>>(
+            block.d_codes, block.d_norms, d_accumulator, block.cols, mse_bits, block.seed);
+        check_cuda(cudaGetLastError(), "launch column TQ fused Lloyd-Max inverse/add fwht256 kernel");
+    } else {
+        column_tq_lloyd_dequantize_kernel<<<blocks, threads, 0, stream>>>(
+            block.d_codes, d_work, block.rows, block.cols, mse_bits);
+        check_cuda(cudaGetLastError(), "launch column TQ Lloyd-Max centroid decode kernel");
+        fwht_columns_normalized_device(d_work, block.rows, block.cols, stream);
+        column_tq_apply_sign_norm_add_kernel<<<blocks, threads, 0, stream>>>(
+            d_work, block.d_norms, d_accumulator, block.rows, block.cols, block.seed);
+        check_cuda(cudaGetLastError(), "launch column TQ inverse/rescale add kernel");
+    }
 
     if (block.mode == QuantizeMode::kTurboQuantQjl && block.qjl_alpha != 0.0f) {
         if (!block.d_qjl_signs) {
@@ -1647,6 +1916,173 @@ void dequantize_column_tq_payload_add_to_fp32(
         check_cuda(cudaGetLastError(), "launch column tq-qjl residual reconstruction add kernel");
     }
     check_cuda(cudaStreamSynchronize(stream), "cudaStreamSynchronize column TQ payload add decode");
+}
+
+void profile_tq_column_decode_add_to_fp32(
+    const DeviceCompressedBlock& block,
+    float* d_accumulator,
+    float* d_work,
+    TqColumnProfileTimings* timings,
+    cudaStream_t stream) {
+    if (!timings) {
+        throw std::runtime_error("TQ profile decode requires non-null timings.");
+    }
+    if (!block.d_codes || !block.d_norms || !d_accumulator || !d_work) {
+        throw std::runtime_error("TQ profile decode received a null device pointer.");
+    }
+    if (block.mode != QuantizeMode::kTurboQuant) {
+        throw std::runtime_error("TQ profile decode only supports mode=tq.");
+    }
+    if (!is_supported_lloyd_tq_dim(block.rows) ||
+        !is_supported_lloyd_tq_bits(block.bits)) {
+        throw std::runtime_error("TQ profile decode received unsupported dimensions or bits.");
+    }
+
+    cudaEvent_t e_start = nullptr;
+    cudaEvent_t e_decode = nullptr;
+    check_cuda(cudaEventCreate(&e_start), "cudaEventCreate TQ profile decode start");
+    check_cuda(cudaEventCreate(&e_decode), "cudaEventCreate TQ profile decode done");
+
+    const std::size_t count = block.value_count();
+    const int threads = 256;
+    const int blocks = static_cast<int>((count + threads - 1) / threads);
+
+    check_cuda(cudaEventRecord(e_start, stream), "cudaEventRecord TQ profile decode start");
+    if (block.rows == 256) {
+        column_tq_lloyd_dequantize_fwht256_apply_add_kernel<<<block.cols, 256, 0, stream>>>(
+            block.d_codes, block.d_norms, d_accumulator, block.cols, block.bits, block.seed);
+        check_cuda(cudaGetLastError(), "launch TQ profile fused decode/add fwht256 kernel");
+    } else {
+        column_tq_lloyd_dequantize_kernel<<<blocks, threads, 0, stream>>>(
+            block.d_codes, d_work, block.rows, block.cols, block.bits);
+        check_cuda(cudaGetLastError(), "launch TQ profile Lloyd-Max decode kernel");
+        fwht_columns_normalized_device(d_work, block.rows, block.cols, stream);
+        column_tq_apply_sign_norm_add_kernel<<<blocks, threads, 0, stream>>>(
+            d_work, block.d_norms, d_accumulator, block.rows, block.cols, block.seed);
+        check_cuda(cudaGetLastError(), "launch TQ profile inverse/rescale add kernel");
+    }
+    check_cuda(cudaEventRecord(e_decode, stream), "cudaEventRecord TQ profile decode done");
+    check_cuda(cudaEventSynchronize(e_decode), "cudaEventSynchronize TQ profile decode");
+    check_cuda(cudaEventElapsedTime(&timings->decode_add_ms, e_start, e_decode),
+               "cudaEventElapsedTime TQ profile decode");
+
+    cudaEventDestroy(e_start);
+    cudaEventDestroy(e_decode);
+}
+
+float profile_tq4_column_quantize_pack4_alt(
+    const float* d_transformed,
+    int rows,
+    int cols,
+    std::uint8_t* d_codes,
+    cudaStream_t stream) {
+    if (!d_transformed || !d_codes) {
+        throw std::runtime_error("TQ4 alt pack profile received a null device pointer.");
+    }
+    if (!is_supported_lloyd_tq_dim(rows) || cols <= 0) {
+        throw std::runtime_error("TQ4 alt pack profile received unsupported dimensions.");
+    }
+
+    cudaEvent_t e_start = nullptr;
+    cudaEvent_t e_done = nullptr;
+    check_cuda(cudaEventCreate(&e_start), "cudaEventCreate TQ4 alt pack start");
+    check_cuda(cudaEventCreate(&e_done), "cudaEventCreate TQ4 alt pack done");
+
+    const std::size_t count = static_cast<std::size_t>(rows) * cols;
+    const std::size_t pairs = (count + 1) / 2;
+    const int threads = 256;
+    const int blocks = static_cast<int>((pairs + threads - 1) / threads);
+
+    check_cuda(cudaEventRecord(e_start, stream), "cudaEventRecord TQ4 alt pack start");
+    column_tq4_lloyd_quantize_pack4_alt_kernel<<<blocks, threads, 0, stream>>>(
+        d_transformed, d_codes, rows, cols);
+    check_cuda(cudaGetLastError(), "launch TQ4 alt pack kernel");
+    check_cuda(cudaEventRecord(e_done, stream), "cudaEventRecord TQ4 alt pack done");
+    check_cuda(cudaEventSynchronize(e_done), "cudaEventSynchronize TQ4 alt pack");
+
+    float elapsed_ms = 0.0f;
+    check_cuda(cudaEventElapsedTime(&elapsed_ms, e_start, e_done),
+               "cudaEventElapsedTime TQ4 alt pack");
+    cudaEventDestroy(e_start);
+    cudaEventDestroy(e_done);
+    return elapsed_ms;
+}
+
+float profile_tq4_column_quantize_branchless_alt(
+    const float* d_transformed,
+    int rows,
+    int cols,
+    std::uint8_t* d_codes,
+    cudaStream_t stream) {
+    if (!d_transformed || !d_codes) {
+        throw std::runtime_error("TQ4 branchless profile received a null device pointer.");
+    }
+    if (!is_supported_lloyd_tq_dim(rows) || cols <= 0) {
+        throw std::runtime_error("TQ4 branchless profile received unsupported dimensions.");
+    }
+
+    cudaEvent_t e_start = nullptr;
+    cudaEvent_t e_done = nullptr;
+    check_cuda(cudaEventCreate(&e_start), "cudaEventCreate TQ4 branchless start");
+    check_cuda(cudaEventCreate(&e_done), "cudaEventCreate TQ4 branchless done");
+
+    const std::size_t count = static_cast<std::size_t>(rows) * cols;
+    const int threads = 256;
+    const int blocks = static_cast<int>((count + threads - 1) / threads);
+
+    check_cuda(cudaMemsetAsync(d_codes, 0, bitpacked_code_bytes(rows, cols, 4), stream),
+               "cudaMemsetAsync TQ4 branchless codes");
+    check_cuda(cudaEventRecord(e_start, stream), "cudaEventRecord TQ4 branchless start");
+    column_tq4_lloyd_quantize_branchless_alt_kernel<<<blocks, threads, 0, stream>>>(
+        d_transformed, d_codes, rows, cols);
+    check_cuda(cudaGetLastError(), "launch TQ4 branchless quantize kernel");
+    check_cuda(cudaEventRecord(e_done, stream), "cudaEventRecord TQ4 branchless done");
+    check_cuda(cudaEventSynchronize(e_done), "cudaEventSynchronize TQ4 branchless");
+
+    float elapsed_ms = 0.0f;
+    check_cuda(cudaEventElapsedTime(&elapsed_ms, e_start, e_done),
+               "cudaEventElapsedTime TQ4 branchless");
+    cudaEventDestroy(e_start);
+    cudaEventDestroy(e_done);
+    return elapsed_ms;
+}
+
+float profile_tq4_column_quantize_pack4_branchless_alt(
+    const float* d_transformed,
+    int rows,
+    int cols,
+    std::uint8_t* d_codes,
+    cudaStream_t stream) {
+    if (!d_transformed || !d_codes) {
+        throw std::runtime_error("TQ4 branchless pack4 profile received a null device pointer.");
+    }
+    if (!is_supported_lloyd_tq_dim(rows) || cols <= 0) {
+        throw std::runtime_error("TQ4 branchless pack4 profile received unsupported dimensions.");
+    }
+
+    cudaEvent_t e_start = nullptr;
+    cudaEvent_t e_done = nullptr;
+    check_cuda(cudaEventCreate(&e_start), "cudaEventCreate TQ4 branchless pack4 start");
+    check_cuda(cudaEventCreate(&e_done), "cudaEventCreate TQ4 branchless pack4 done");
+
+    const std::size_t count = static_cast<std::size_t>(rows) * cols;
+    const std::size_t pairs = (count + 1) / 2;
+    const int threads = 256;
+    const int blocks = static_cast<int>((pairs + threads - 1) / threads);
+
+    check_cuda(cudaEventRecord(e_start, stream), "cudaEventRecord TQ4 branchless pack4 start");
+    column_tq4_lloyd_quantize_pack4_branchless_alt_kernel<<<blocks, threads, 0, stream>>>(
+        d_transformed, d_codes, rows, cols);
+    check_cuda(cudaGetLastError(), "launch TQ4 branchless pack4 kernel");
+    check_cuda(cudaEventRecord(e_done, stream), "cudaEventRecord TQ4 branchless pack4 done");
+    check_cuda(cudaEventSynchronize(e_done), "cudaEventSynchronize TQ4 branchless pack4");
+
+    float elapsed_ms = 0.0f;
+    check_cuda(cudaEventElapsedTime(&elapsed_ms, e_start, e_done),
+               "cudaEventElapsedTime TQ4 branchless pack4");
+    cudaEventDestroy(e_start);
+    cudaEventDestroy(e_done);
+    return elapsed_ms;
 }
 
 // (README) GPU 壓縮重建測試入口: 將 device FP32 block 壓縮後解碼回 host vector 以便檢查誤差。

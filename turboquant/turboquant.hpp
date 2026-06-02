@@ -65,6 +65,14 @@ struct DeviceCompressedBlock {
     std::size_t payload_bytes() const;
 };
 
+struct TqColumnProfileTimings {
+    float clear_codes_ms = 0.0f;
+    float norm_ms = 0.0f;
+    float transform_ms = 0.0f;
+    float quantize_ms = 0.0f;
+    float decode_add_ms = 0.0f;
+};
+
 QuantizeOptions make_quantize_options(int bits);
 QuantizeOptions make_quantize_options(
     int bits,
@@ -183,6 +191,45 @@ void dequantize_column_tq_payload_add_to_fp32(
     float* d_accumulator,
     float* d_work,
     const signed char* d_signs = nullptr,
+    cudaStream_t stream = 0);
+
+DeviceCompressedBlock profile_tq_column_encode_to_device_payload(
+    const float* d_values,
+    int rows,
+    int cols,
+    const QuantizeOptions& options,
+    std::uint8_t* d_codes,
+    float* d_norms,
+    float* d_work,
+    TqColumnProfileTimings* timings,
+    cudaStream_t stream = 0);
+
+void profile_tq_column_decode_add_to_fp32(
+    const DeviceCompressedBlock& block,
+    float* d_accumulator,
+    float* d_work,
+    TqColumnProfileTimings* timings,
+    cudaStream_t stream = 0);
+
+float profile_tq4_column_quantize_pack4_alt(
+    const float* d_transformed,
+    int rows,
+    int cols,
+    std::uint8_t* d_codes,
+    cudaStream_t stream = 0);
+
+float profile_tq4_column_quantize_branchless_alt(
+    const float* d_transformed,
+    int rows,
+    int cols,
+    std::uint8_t* d_codes,
+    cudaStream_t stream = 0);
+
+float profile_tq4_column_quantize_pack4_branchless_alt(
+    const float* d_transformed,
+    int rows,
+    int cols,
+    std::uint8_t* d_codes,
     cudaStream_t stream = 0);
 
 std::vector<float> dequantize_fp32_block(const CompressedBlock& block);

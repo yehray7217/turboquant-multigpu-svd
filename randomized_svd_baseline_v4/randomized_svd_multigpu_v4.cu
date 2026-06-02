@@ -29,6 +29,7 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <iomanip>
 #include <iostream>
@@ -1005,9 +1006,12 @@ int main(int argc, char** argv) {
                 CHECK_CUDA(cudaMalloc(&d_work_z, static_cast<size_t>(lwork_z) * sizeof(float)));
             }
 
+            if (opt.subspace_iter > 0) {
+                CHECK_CUDA(cudaMalloc(&d_mpi_Z_global, z_fp32_bytes));
+            }
+
             if (opt.subspace_iter > 0 && !compress_subspace_none) {
                 CHECK_CUDA(cudaMalloc(&d_mpi_Z_local, z_fp32_bytes));
-                CHECK_CUDA(cudaMalloc(&d_mpi_Z_global, z_fp32_bytes));
                 CHECK_CUDA(cudaMalloc(&d_mpi_ZT_local, z_fp32_bytes));
                 CHECK_CUDA(cudaMalloc(&d_mpi_ZT_global, z_fp32_bytes));
                 CHECK_CUDA(cudaMalloc(&d_mpi_Z_work, z_payload_work_count * sizeof(float)));
@@ -1114,10 +1118,16 @@ int main(int argc, char** argv) {
         std::vector<double> repeat_total_ms;
         std::vector<double> repeat_gpu_compute_ms;
         std::vector<double> repeat_host_staging_ms;
+        std::vector<double> repeat_host_copy_d2h_ms;
+        std::vector<double> repeat_host_copy_h2d_ms;
+        std::vector<double> repeat_host_copy_other_ms;
+        std::vector<double> repeat_host_stage_cpu_ms;
         std::vector<double> repeat_nvlink_ms;
         std::vector<double> repeat_infiniband_ms;
         std::vector<double> repeat_other_sync_ms;
         std::vector<double> repeat_host_gpu_payload_bytes;
+        std::vector<double> repeat_host_gpu_d2h_payload_bytes;
+        std::vector<double> repeat_host_gpu_h2d_payload_bytes;
         std::vector<double> repeat_nvlink_payload_bytes;
         std::vector<double> repeat_infiniband_payload_bytes;
         std::vector<double> repeat_b_relative_error;
@@ -1126,10 +1136,16 @@ int main(int argc, char** argv) {
         repeat_total_ms.reserve(opt.repeat);
         repeat_gpu_compute_ms.reserve(opt.repeat);
         repeat_host_staging_ms.reserve(opt.repeat);
+        repeat_host_copy_d2h_ms.reserve(opt.repeat);
+        repeat_host_copy_h2d_ms.reserve(opt.repeat);
+        repeat_host_copy_other_ms.reserve(opt.repeat);
+        repeat_host_stage_cpu_ms.reserve(opt.repeat);
         repeat_nvlink_ms.reserve(opt.repeat);
         repeat_infiniband_ms.reserve(opt.repeat);
         repeat_other_sync_ms.reserve(opt.repeat);
         repeat_host_gpu_payload_bytes.reserve(opt.repeat);
+        repeat_host_gpu_d2h_payload_bytes.reserve(opt.repeat);
+        repeat_host_gpu_h2d_payload_bytes.reserve(opt.repeat);
         repeat_nvlink_payload_bytes.reserve(opt.repeat);
         repeat_infiniband_payload_bytes.reserve(opt.repeat);
         repeat_b_relative_error.reserve(opt.repeat);
@@ -1153,9 +1169,15 @@ int main(int argc, char** argv) {
         double current_A_norm2 = h_A_norm2;
         double diagnostic_excluded_ms = 0.0;
         double host_staging_time_ms = 0.0;
+        double host_copy_d2h_ms = 0.0;
+        double host_copy_h2d_ms = 0.0;
+        double host_copy_other_ms = 0.0;
+        double host_stage_cpu_ms = 0.0;
         double nvlink_time_ms = 0.0;
         double infiniband_time_ms = 0.0;
         unsigned long long host_gpu_payload_bytes = 0;
+        unsigned long long host_gpu_d2h_payload_bytes = 0;
+        unsigned long long host_gpu_h2d_payload_bytes = 0;
         unsigned long long nvlink_payload_bytes = 0;
         unsigned long long infiniband_payload_bytes = 0;
         std::vector<std::vector<float>> h_A_blocks_repeat;
@@ -1216,9 +1238,18 @@ int main(int argc, char** argv) {
             Timer host_copy_timer;
             host_copy_timer.tic();
             CHECK_CUDA(cudaMemcpy(dst, src, bytes, kind));
-            host_staging_time_ms += host_copy_timer.toc_ms();
-            if (kind == cudaMemcpyHostToDevice || kind == cudaMemcpyDeviceToHost) {
+            const double elapsed_ms = host_copy_timer.toc_ms();
+            host_staging_time_ms += elapsed_ms;
+            if (kind == cudaMemcpyHostToDevice) {
+                host_copy_h2d_ms += elapsed_ms;
                 host_gpu_payload_bytes += static_cast<unsigned long long>(bytes);
+                host_gpu_h2d_payload_bytes += static_cast<unsigned long long>(bytes);
+            } else if (kind == cudaMemcpyDeviceToHost) {
+                host_copy_d2h_ms += elapsed_ms;
+                host_gpu_payload_bytes += static_cast<unsigned long long>(bytes);
+                host_gpu_d2h_payload_bytes += static_cast<unsigned long long>(bytes);
+            } else {
+                host_copy_other_ms += elapsed_ms;
             }
         };
         auto timed_host_stage = [&](auto&& stage_work) {
@@ -1226,7 +1257,9 @@ int main(int argc, char** argv) {
             Timer host_stage_timer;
             host_stage_timer.tic();
             stage_work();
-            host_staging_time_ms += host_stage_timer.toc_ms();
+            const double elapsed_ms = host_stage_timer.toc_ms();
+            host_staging_time_ms += elapsed_ms;
+            host_stage_cpu_ms += elapsed_ms;
         };
 
         Timer total_timer;
@@ -1546,6 +1579,8 @@ int main(int argc, char** argv) {
                             MPI_COMM_WORLD);
                     }, static_cast<unsigned long long>(z_fp32_bytes));
                     z_transmitted_payload_bytes += z_fp32_bytes;
+                    CHECK_CUDA(cudaSetDevice(0));
+                    timed_host_copy(d_mpi_Z_global, h_Z_global.data(), z_fp32_bytes, cudaMemcpyHostToDevice);
                 } else {
                     Timer subspace_compress_timer;
                     subspace_compress_timer.tic();
@@ -1719,13 +1754,13 @@ int main(int argc, char** argv) {
                         CHECK_CUDA(cudaGetLastError());
                     }
                     CHECK_CUDA(cudaDeviceSynchronize());
-                    timed_host_copy(h_Z_global.data(), d_mpi_Z_global, z_fp32_bytes, cudaMemcpyDeviceToHost);
                 }
 
+                float* d_subspace_Z_source = d_mpi_Z_global;
                 if (opt.stabilize_subspace_z) {
                     NvtxRange z_qr_range("orthogonalize_subspace_Z");
                     CHECK_CUDA(cudaSetDevice(0));
-                    timed_host_copy(d_Z_qr, h_Z_global.data(), z_fp32_bytes, cudaMemcpyHostToDevice);
+                    CHECK_CUDA(cudaMemcpy(d_Z_qr, d_mpi_Z_global, z_fp32_bytes, cudaMemcpyDeviceToDevice));
                     CHECK_CUSOLVER(cusolverDnSgeqrf(
                         solver0, n, l, d_Z_qr, n, d_tau_z, d_work_z, lwork_z, d_info0));
                     CHECK_CUDA(cudaDeviceSynchronize());
@@ -1734,13 +1769,17 @@ int main(int argc, char** argv) {
                         solver0, n, l, l, d_Z_qr, n, d_tau_z, d_work_z, lwork_z, d_info0));
                     CHECK_CUDA(cudaDeviceSynchronize());
                     check_solver_info(d_info0, "subspace Z orgqr");
-                    timed_host_copy(h_Z_global.data(), d_Z_qr, z_fp32_bytes, cudaMemcpyDeviceToHost);
+                    d_subspace_Z_source = d_Z_qr;
                 }
 
                 for (int g = 0; g < opt.ngpus; ++g) {
                     DeviceWork& w = works[g];
                     CHECK_CUDA(cudaSetDevice(w.dev));
-                    timed_host_copy(w.d_Z, h_Z_global.data(), z_fp32_bytes, cudaMemcpyHostToDevice);
+                    if (w.dev == 0) {
+                        CHECK_CUDA(cudaMemcpy(w.d_Z, d_subspace_Z_source, z_fp32_bytes, cudaMemcpyDeviceToDevice));
+                    } else {
+                        timed_peer_copy(w.d_Z, w.dev, d_subspace_Z_source, 0, z_fp32_bytes);
+                    }
                     const float alpha = 1.0f;
                     const float beta = 0.0f;
                     CHECK_CUBLAS(cublasSgemm(
@@ -2514,29 +2553,47 @@ int main(int argc, char** argv) {
         double total_algorithm_ms_max = 0.0;
         double gpu_compute_ms_max = 0.0;
         double host_staging_time_ms_max = 0.0;
+        double host_copy_d2h_ms_max = 0.0;
+        double host_copy_h2d_ms_max = 0.0;
+        double host_copy_other_ms_max = 0.0;
+        double host_stage_cpu_ms_max = 0.0;
         double nvlink_time_ms_max = 0.0;
         double infiniband_time_ms_max = 0.0;
         double other_sync_ms_max = 0.0;
         unsigned long long host_gpu_payload_bytes_global = 0;
+        unsigned long long host_gpu_d2h_payload_bytes_global = 0;
+        unsigned long long host_gpu_h2d_payload_bytes_global = 0;
         unsigned long long nvlink_payload_bytes_global = 0;
         unsigned long long infiniband_payload_bytes_global = 0;
         CHECK_MPI(MPI_Reduce(&total_algorithm_ms, &total_algorithm_ms_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD));
         CHECK_MPI(MPI_Reduce(&gpu_compute_ms, &gpu_compute_ms_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD));
         CHECK_MPI(MPI_Reduce(&host_staging_time_ms, &host_staging_time_ms_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD));
+        CHECK_MPI(MPI_Reduce(&host_copy_d2h_ms, &host_copy_d2h_ms_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD));
+        CHECK_MPI(MPI_Reduce(&host_copy_h2d_ms, &host_copy_h2d_ms_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD));
+        CHECK_MPI(MPI_Reduce(&host_copy_other_ms, &host_copy_other_ms_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD));
+        CHECK_MPI(MPI_Reduce(&host_stage_cpu_ms, &host_stage_cpu_ms_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD));
         CHECK_MPI(MPI_Reduce(&nvlink_time_ms, &nvlink_time_ms_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD));
         CHECK_MPI(MPI_Reduce(&infiniband_time_ms, &infiniband_time_ms_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD));
         CHECK_MPI(MPI_Reduce(&other_sync_ms, &other_sync_ms_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD));
         CHECK_MPI(MPI_Reduce(&host_gpu_payload_bytes, &host_gpu_payload_bytes_global, 1, MPI_UNSIGNED_LONG_LONG, MPI_SUM, 0, MPI_COMM_WORLD));
+        CHECK_MPI(MPI_Reduce(&host_gpu_d2h_payload_bytes, &host_gpu_d2h_payload_bytes_global, 1, MPI_UNSIGNED_LONG_LONG, MPI_SUM, 0, MPI_COMM_WORLD));
+        CHECK_MPI(MPI_Reduce(&host_gpu_h2d_payload_bytes, &host_gpu_h2d_payload_bytes_global, 1, MPI_UNSIGNED_LONG_LONG, MPI_SUM, 0, MPI_COMM_WORLD));
         CHECK_MPI(MPI_Reduce(&nvlink_payload_bytes, &nvlink_payload_bytes_global, 1, MPI_UNSIGNED_LONG_LONG, MPI_SUM, 0, MPI_COMM_WORLD));
         CHECK_MPI(MPI_Reduce(&infiniband_payload_bytes, &infiniband_payload_bytes_global, 1, MPI_UNSIGNED_LONG_LONG, MPI_SUM, 0, MPI_COMM_WORLD));
         if (is_root) {
             repeat_total_ms.push_back(total_algorithm_ms_max);
             repeat_gpu_compute_ms.push_back(gpu_compute_ms_max);
             repeat_host_staging_ms.push_back(host_staging_time_ms_max);
+            repeat_host_copy_d2h_ms.push_back(host_copy_d2h_ms_max);
+            repeat_host_copy_h2d_ms.push_back(host_copy_h2d_ms_max);
+            repeat_host_copy_other_ms.push_back(host_copy_other_ms_max);
+            repeat_host_stage_cpu_ms.push_back(host_stage_cpu_ms_max);
             repeat_nvlink_ms.push_back(nvlink_time_ms_max);
             repeat_infiniband_ms.push_back(infiniband_time_ms_max);
             repeat_other_sync_ms.push_back(other_sync_ms_max);
             repeat_host_gpu_payload_bytes.push_back(static_cast<double>(host_gpu_payload_bytes_global));
+            repeat_host_gpu_d2h_payload_bytes.push_back(static_cast<double>(host_gpu_d2h_payload_bytes_global));
+            repeat_host_gpu_h2d_payload_bytes.push_back(static_cast<double>(host_gpu_h2d_payload_bytes_global));
             repeat_nvlink_payload_bytes.push_back(static_cast<double>(nvlink_payload_bytes_global));
             repeat_infiniband_payload_bytes.push_back(static_cast<double>(infiniband_payload_bytes_global));
             if (opt.check_b_error) {
@@ -2557,12 +2614,20 @@ int main(int argc, char** argv) {
                           << "  Total Time          " << total_algorithm_ms_max << " ms\n"
                           << "  GPU Compute Time    " << gpu_compute_ms_max << " ms\n"
                           << "  Host/Staging Time   " << host_staging_time_ms_max << " ms\n"
+                          << "    D2H Copy Time     " << host_copy_d2h_ms_max << " ms\n"
+                          << "    H2D Copy Time     " << host_copy_h2d_ms_max << " ms\n"
+                          << "    Other Host Copy   " << host_copy_other_ms_max << " ms\n"
+                          << "    CPU Stage Time    " << host_stage_cpu_ms_max << " ms\n"
                           << "  NVLink Time         " << nvlink_time_ms_max << " ms\n"
                           << "  InfiniBand Time     " << infiniband_time_ms_max << " ms\n"
                           << "  Other/Sync Time     " << other_sync_ms_max << " ms\n";
                 std::cout << "\nPayload Summary (repeat)\n"
                           << "  Host-GPU Payload    "
                           << (static_cast<double>(host_gpu_payload_bytes_global) * mib_scale) << " MiB\n"
+                          << "    D2H Payload       "
+                          << (static_cast<double>(host_gpu_d2h_payload_bytes_global) * mib_scale) << " MiB\n"
+                          << "    H2D Payload       "
+                          << (static_cast<double>(host_gpu_h2d_payload_bytes_global) * mib_scale) << " MiB\n"
                           << "  NVLink Payload      "
                           << (static_cast<double>(nvlink_payload_bytes_global) * mib_scale) << " MiB\n"
                           << "  InfiniBand Payload  "
@@ -2614,6 +2679,10 @@ int main(int argc, char** argv) {
                 print_summary_stats_row("Total Time", summarize_samples(repeat_total_ms, warm_begin), label_width, 1.0, " ms");
                 print_summary_stats_row("GPU Compute Time", summarize_samples(repeat_gpu_compute_ms, warm_begin), label_width, 1.0, " ms");
                 print_summary_stats_row("Host/Staging Time", summarize_samples(repeat_host_staging_ms, warm_begin), label_width, 1.0, " ms");
+                print_summary_stats_row("  D2H Copy Time", summarize_samples(repeat_host_copy_d2h_ms, warm_begin), label_width, 1.0, " ms");
+                print_summary_stats_row("  H2D Copy Time", summarize_samples(repeat_host_copy_h2d_ms, warm_begin), label_width, 1.0, " ms");
+                print_summary_stats_row("  Other Host Copy", summarize_samples(repeat_host_copy_other_ms, warm_begin), label_width, 1.0, " ms");
+                print_summary_stats_row("  CPU Stage Time", summarize_samples(repeat_host_stage_cpu_ms, warm_begin), label_width, 1.0, " ms");
                 print_summary_stats_row("NVLink Time", summarize_samples(repeat_nvlink_ms, warm_begin), label_width, 1.0, " ms");
                 print_summary_stats_row("InfiniBand Time", summarize_samples(repeat_infiniband_ms, warm_begin), label_width, 1.0, " ms");
                 print_summary_stats_row("Other/Sync Time", summarize_samples(repeat_other_sync_ms, warm_begin), label_width, 1.0, " ms");
@@ -2626,6 +2695,18 @@ int main(int argc, char** argv) {
                 print_summary_stats_row(
                     "Host-GPU Payload",
                     summarize_samples(repeat_host_gpu_payload_bytes, warm_begin),
+                    label_width,
+                    1.0 / 1024.0 / 1024.0,
+                    " MiB");
+                print_summary_stats_row(
+                    "  D2H Payload",
+                    summarize_samples(repeat_host_gpu_d2h_payload_bytes, warm_begin),
+                    label_width,
+                    1.0 / 1024.0 / 1024.0,
+                    " MiB");
+                print_summary_stats_row(
+                    "  H2D Payload",
+                    summarize_samples(repeat_host_gpu_h2d_payload_bytes, warm_begin),
                     label_width,
                     1.0 / 1024.0 / 1024.0,
                     " MiB");
