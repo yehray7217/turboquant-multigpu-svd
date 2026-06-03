@@ -75,6 +75,10 @@ The slurm script runs:
 |---:|---:|---:|---:|---:|---|
 | 256 | 16384 | 4 | 20 | 200 | Current RSVD-scale TQ vector count |
 | 256 | 32768 | 4 | 20 | 200 | Larger vector count for scaling/noise reduction |
+| 256 | 16384 | 2 | 20 | 200 | TQ2 specialized pack4 kernel check |
+| 256 | 32768 | 2 | 20 | 200 | TQ2 larger vector count |
+| 256 | 16384 | 1 | 20 | 200 | TQ1 sign-pack8 kernel check |
+| 256 | 32768 | 1 | 20 | 200 | TQ1 larger vector count |
 
 ## Interpretation
 
@@ -98,6 +102,166 @@ bitpack_read_code
 ```
 
 QJL is intentionally excluded from this experiment.
+
+## Current TQ1/TQ2 Kernel Paths
+
+TQ1 and TQ2 now use dedicated encode pack kernels instead of the generic
+per-coordinate atomic bitpack path:
+
+| Mode | Encode pack kernel | Packing |
+|---|---|---|
+| TQ2 | `column_tq2_lloyd_quantize_pack4_kernel` | one thread packs four 2-bit codes into one byte |
+| TQ1 | `column_tq1_sign_quantize_pack8_kernel` | one thread packs eight sign bits into one byte |
+
+TQ1 remains a sign-only feasibility codec. It stores the sign of each rotated
+coordinate and decodes with a fixed centroid magnitude. Use this microbenchmark
+to check kernel time first; error quality is a separate question.
+
+TQ2 also uses a branchless 4-level bucket lookup, matching the idea used by the
+TQ4 branchless bucket path. TQ1/TQ2 skip `clear_codes` because the pack kernels
+overwrite the whole bit-packed code buffer.
+
+The decode path now uses a byte-aligned bit reader for TQ1/TQ2/TQ4. These
+formats are naturally packed inside bytes, so the decoder can avoid the generic
+32-bit cross-word reader in the common TQ cases. This targets `decode_event`
+and does not change the NONE pipeline.
+
+The active TQ4 encode path now also uses the faster pack4 branchless kernel:
+
+| Mode | Encode pack kernel | Packing |
+|---|---|---|
+| TQ4 | `column_tq4_lloyd_quantize_pack4_branchless_alt_kernel` | one thread packs two 4-bit codes into one byte |
+
+Because TQ4/TQ2/TQ1 active pack kernels fully overwrite the packed-code buffer,
+all three skip `clear_codes` in the encode path.
+
+Word-pack trial:
+
+- TQ2 pack16 and TQ1 pack32 were tested after the first specialized pack
+  kernels.
+- They packed more codes per thread into a 32-bit word.
+- They were slower on V100 because they reduced thread-level parallelism too
+  much.
+- The active path was therefore reverted to byte-level pack4/pack8.
+
+## Result: Byte-Aligned Decode Reader
+
+Run:
+
+```text
+date = 2026-06-03
+job_id = 943649
+GPU = 1 x V100
+rows = 256
+warmup = 20
+repeat = 200
+```
+
+| bits | cols | encode_event_total | quantize_bitpack | decode_event | roundtrip_event_total | relative_error |
+|---:|---:|---:|---:|---:|---:|---:|
+| 4 | 16384 | 0.2108 ms | 0.0719 ms | 0.0808 ms | 0.2916 ms | 0.09717795 |
+| 2 | 16384 | 0.1679 ms | 0.0337 ms | 0.0792 ms | 0.2471 ms | 0.34210020 |
+| 1 | 16384 | 0.1686 ms | 0.0343 ms | 0.0762 ms | 0.2447 ms | 0.60229535 |
+| 4 | 32768 | 0.3942 ms | 0.1347 ms | 0.1552 ms | 0.5494 ms | 0.09720906 |
+| 2 | 32768 | 0.3093 ms | 0.0570 ms | 0.1521 ms | 0.4613 ms | 0.34211192 |
+| 1 | 32768 | 0.3087 ms | 0.0567 ms | 0.1462 ms | 0.4549 ms | 0.60227001 |
+
+Comparison with the previous active byte-pack result:
+
+| bits | cols | decode before | decode after | roundtrip before | roundtrip after |
+|---:|---:|---:|---:|---:|---:|
+| 4 | 16384 | 0.0852 ms | 0.0808 ms | 0.2962 ms | 0.2916 ms |
+| 2 | 16384 | 0.0819 ms | 0.0792 ms | 0.2582 ms | 0.2471 ms |
+| 1 | 16384 | 0.0790 ms | 0.0762 ms | 0.2501 ms | 0.2447 ms |
+| 4 | 32768 | 0.1640 ms | 0.1552 ms | 0.5583 ms | 0.5494 ms |
+| 2 | 32768 | 0.1576 ms | 0.1521 ms | 0.4790 ms | 0.4613 ms |
+| 1 | 32768 | 0.1520 ms | 0.1462 ms | 0.4641 ms | 0.4549 ms |
+
+Decision: **keep**.
+
+The byte-aligned reader improves the decode side for all tested TQ bit widths.
+It does not affect NONE, and it keeps the faster byte-level TQ1/TQ2 encode path.
+
+## Result: Active TQ4 Pack4 Branchless Encode
+
+Run:
+
+```text
+date = 2026-06-03
+job_id = 943673
+GPU = 1 x V100
+rows = 256
+warmup = 20
+repeat = 200
+```
+
+| bits | cols | encode_event_total | clear_codes | quantize_bitpack | decode_event | roundtrip_event_total | relative_error |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 4 | 16384 | 0.1810 ms | 0.0026 ms | 0.0470 ms | 0.0807 ms | 0.2618 ms | 0.09717795 |
+| 4 | 32768 | 0.3054 ms | 0.0024 ms | 0.0776 ms | 0.1415 ms | 0.4469 ms | 0.09720906 |
+| 2 | 16384 | 0.1514 ms | 0.0024 ms | 0.0330 ms | 0.0701 ms | 0.2215 ms | 0.34210020 |
+| 2 | 32768 | 0.2786 ms | 0.0023 ms | 0.0567 ms | 0.1350 ms | 0.4135 ms | 0.34211192 |
+| 1 | 16384 | 0.1518 ms | 0.0024 ms | 0.0334 ms | 0.0678 ms | 0.2196 ms | 0.60229535 |
+| 1 | 32768 | 0.2779 ms | 0.0024 ms | 0.0560 ms | 0.1300 ms | 0.4079 ms | 0.60227001 |
+
+Comparison with the previous byte-aligned decode run:
+
+| bits | cols | encode before | encode after | quantize before | quantize after | roundtrip before | roundtrip after |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 4 | 16384 | 0.2108 ms | 0.1810 ms | 0.0719 ms | 0.0470 ms | 0.2916 ms | 0.2618 ms |
+| 4 | 32768 | 0.3942 ms | 0.3054 ms | 0.1347 ms | 0.0776 ms | 0.5494 ms | 0.4469 ms |
+| 2 | 16384 | 0.1679 ms | 0.1514 ms | 0.0337 ms | 0.0330 ms | 0.2471 ms | 0.2215 ms |
+| 2 | 32768 | 0.3093 ms | 0.2786 ms | 0.0570 ms | 0.0567 ms | 0.4613 ms | 0.4135 ms |
+| 1 | 16384 | 0.1686 ms | 0.1518 ms | 0.0343 ms | 0.0334 ms | 0.2447 ms | 0.2196 ms |
+| 1 | 32768 | 0.3087 ms | 0.2779 ms | 0.0567 ms | 0.0560 ms | 0.4549 ms | 0.4079 ms |
+
+Decision: **keep**.
+
+The main intended effect is on TQ4:
+
+```text
+TQ4 quantize_bitpack 16k: 0.0719 ms -> 0.0470 ms
+TQ4 quantize_bitpack 32k: 0.1347 ms -> 0.0776 ms
+TQ4 roundtrip 16k:        0.2916 ms -> 0.2618 ms
+TQ4 roundtrip 32k:        0.5494 ms -> 0.4469 ms
+```
+
+The active TQ4 path now matches the previously measured
+`quantize_pack4_branchless_alt` path closely. TQ2/TQ1 also improved in this run,
+mostly from stable byte-pack/decode-fast-path behavior and lower measured
+norm/transform timings on this allocation.
+
+## Result: TQ1/TQ2 Specialized Pack Kernels
+
+Run:
+
+```text
+date = 2026-06-03
+job_id = 943572
+GPU = 1 x V100
+rows = 256
+warmup = 20
+repeat = 200
+```
+
+| bits | cols | code bytes | encode_event_total | quantize_bitpack | decode_event | roundtrip_event_total | relative_error |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 4 | 16384 | 2.000 MiB | 0.2110 ms | 0.0719 ms | 0.0852 ms | 0.2962 ms | 0.09717795 |
+| 2 | 16384 | 1.000 MiB | 0.1763 ms | 0.0389 ms | 0.0819 ms | 0.2582 ms | 0.34210020 |
+| 1 | 16384 | 0.500 MiB | 0.1711 ms | 0.0339 ms | 0.0790 ms | 0.2501 ms | 0.60229535 |
+| 4 | 32768 | 4.000 MiB | 0.3943 ms | 0.1347 ms | 0.1640 ms | 0.5583 ms | 0.09720906 |
+| 2 | 32768 | 2.000 MiB | 0.3214 ms | 0.0645 ms | 0.1576 ms | 0.4790 ms | 0.34211192 |
+| 1 | 32768 | 1.000 MiB | 0.3121 ms | 0.0568 ms | 0.1520 ms | 0.4641 ms | 0.60227001 |
+
+Interpretation:
+
+- TQ2 and TQ1 now reduce the encode path at kernel level.
+- The main gain is `quantize_bitpack`, which drops because TQ1/TQ2 avoid the
+  generic per-coordinate atomic bitpack.
+- Decode also improves slightly because smaller bit payloads reduce bit-read
+  and memory pressure.
+- Error is much larger for lower bits, especially TQ1. These are speed/payload
+  candidates first; accuracy needs a separate benchmark.
 
 ## Result: 2026-06-02
 

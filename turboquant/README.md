@@ -20,9 +20,10 @@ mode = lowbit   bits = 2  symmetric int2 quantization, packed four values per by
 mode = tq       bits = 8  TurboQuant first-stage with int8 main codes
 mode = tq       bits = 4  TurboQuant first-stage with int4 main codes
 mode = tq       bits = 2  TurboQuant first-stage with int2 main codes
-mode = tq-qjl   bits = 8  TurboQuant/QJL prototype with int8 main codes
-mode = tq-qjl   bits = 4  TurboQuant/QJL prototype with int4 main codes
-mode = tq-qjl   bits = 2  TurboQuant/QJL prototype with int2 main codes
+mode = tq       bits = 1  TurboQuant first-stage with sign-only main codes
+mode = tq-qjl   bits = 8  TurboQuant/QJL prototype with 7-bit main codes + 1-bit residual signs
+mode = tq-qjl   bits = 4  TurboQuant/QJL prototype with 3-bit main codes + 1-bit residual signs
+mode = tq-qjl   bits = 3  TurboQuant/QJL prototype with 2-bit main codes + 1-bit residual signs
 ```
 
 The `lowbit` quantizer uses per-block symmetric scaling:
@@ -80,6 +81,12 @@ The `tq` mode performs:
 2. Normalized fast Walsh-Hadamard transform.
 3. Low-bit scalar quantization in the rotated domain.
 4. Inverse transform and inverse sign reconstruction.
+
+`tq` bits 2..8 use generated Lloyd-Max codebooks in the rotated domain. `tq`
+bits 1 is a first runnable sign-only variant: it stores one sign bit per
+rotated coordinate and reconstructs with a fixed Gaussian absolute-mean
+centroid. It is intended for feasibility/timing experiments first; accuracy
+needs separate validation.
 
 The `tq-qjl` mode additionally performs:
 

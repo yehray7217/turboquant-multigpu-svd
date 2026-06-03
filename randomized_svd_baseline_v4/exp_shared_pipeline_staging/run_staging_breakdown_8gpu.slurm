@@ -72,5 +72,7 @@ nvidia-smi -L
 
 run_case "none" "none" 0 "none" 0
 run_case "TQ4" "tq" 4 "tq" 4
+run_case "TQ2" "tq" 2 "tq" 2
+run_case "TQ1" "tq" 1 "tq" 1
 
 echo "staging breakdown complete."

@@ -147,7 +147,7 @@ struct AbsValue {
 
 
 __host__ __device__ bool is_supported_lloyd_tq_bits(int bits) {
-    return bits >= 2 && bits <= 8;
+    return bits >= 1 && bits <= 8;
 }
 
 __host__ __device__ bool is_supported_lloyd_tq_dim(int dim) {
@@ -177,7 +177,7 @@ std::size_t lloyd_tq_code_bytes(int rows, int cols, int bits) {
         throw std::runtime_error("Lloyd-Max TQ codebook path requires vector dimension d in {256, 512, 1024, 2048}.");
     }
     if (!is_supported_lloyd_tq_bits(bits)) {
-        throw std::runtime_error("Lloyd-Max TQ codebook path requires MSE bits in [2, 8].");
+        throw std::runtime_error("Lloyd-Max TQ codebook path requires MSE bits in [1, 8].");
     }
     return bitpacked_code_bytes(rows, cols, bits);
 }
@@ -203,7 +203,7 @@ void validate_column_tq_options(int rows, int cols, const QuantizeOptions& optio
     }
     if (options.mode == QuantizeMode::kTurboQuant) {
         if (!is_supported_lloyd_tq_bits(options.bits)) {
-            throw std::runtime_error(std::string(context) + " mode=tq requires bits in [2, 8].");
+            throw std::runtime_error(std::string(context) + " mode=tq requires bits in [1, 8].");
         }
         return;
     }
@@ -223,6 +223,9 @@ void validate_column_tq_options(int rows, int cols, const QuantizeOptions& optio
 }
 
 __device__ int lloyd_tq_bucket(float value, int dim, int bits) {
+    if (bits == 1) {
+        return value >= 0.0f ? 1 : 0;
+    }
     const int levels = 1 << bits;
     const TQDeviceCodebook codebook = get_tq_codebook_device(dim, bits);
     const float* boundaries = codebook.boundaries;
@@ -234,6 +237,11 @@ __device__ int lloyd_tq_bucket(float value, int dim, int bits) {
     return levels - 1;
 }
 
+__host__ __device__ float tq1_centroid(int dim, int code) {
+    const float magnitude = sqrtf(2.0f / (3.14159265358979323846f * static_cast<float>(dim)));
+    return code ? magnitude : -magnitude;
+}
+
 __device__ int lloyd_tq_bucket_branchless4(float value, int dim) {
     const TQDeviceCodebook codebook = get_tq_codebook_device(dim, 4);
     const float* boundaries = codebook.boundaries;
@@ -241,6 +249,18 @@ __device__ int lloyd_tq_bucket_branchless4(float value, int dim) {
     int code = 0;
 #pragma unroll
     for (int i = 1; i < 16; ++i) {
+        code += (value >= boundaries[i]) ? 1 : 0;
+    }
+    return code;
+}
+
+__device__ int lloyd_tq_bucket_branchless2(float value, int dim) {
+    const TQDeviceCodebook codebook = get_tq_codebook_device(dim, 2);
+    const float* boundaries = codebook.boundaries;
+    if (!boundaries || codebook.levels != 4 || isnan(value)) return 0;
+    int code = 0;
+#pragma unroll
+    for (int i = 1; i < 4; ++i) {
         code += (value >= boundaries[i]) ? 1 : 0;
     }
     return code;
@@ -270,6 +290,22 @@ __device__ int bitpack_read_code(const std::uint8_t* packed, std::size_t idx, in
         value |= words[word_idx + 1] << (32 - shift);
     }
     return static_cast<int>(value & mask);
+}
+
+__device__ int bitpack_read_code_byte_aligned(const std::uint8_t* packed, std::size_t idx, int bits) {
+    if (bits == 1) {
+        const std::uint8_t byte = packed[idx >> 3];
+        return static_cast<int>((byte >> (idx & 7U)) & 0x01U);
+    }
+    if (bits == 2) {
+        const std::uint8_t byte = packed[idx >> 2];
+        return static_cast<int>((byte >> ((idx & 3U) << 1)) & 0x03U);
+    }
+    if (bits == 4) {
+        const std::uint8_t byte = packed[idx >> 1];
+        return static_cast<int>((byte >> ((idx & 1U) << 2)) & 0x0fU);
+    }
+    return bitpack_read_code(packed, idx, bits);
 }
 
 struct QjlMatrixCacheEntry {
@@ -624,6 +660,51 @@ __global__ void column_tq_lloyd_quantize_kernel(
     bitpack_write_code(codes, idx, bits, code);
 }
 
+__global__ void column_tq1_sign_quantize_pack8_kernel(
+    const float* transformed,
+    std::uint8_t* codes,
+    int rows,
+    int cols) {
+    const std::size_t byte_idx = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const std::size_t count = static_cast<std::size_t>(rows) * cols;
+    const std::size_t idx0 = byte_idx * 8;
+    if (idx0 >= count) return;
+
+    unsigned int packed = 0;
+#pragma unroll
+    for (int lane = 0; lane < 8; ++lane) {
+        const std::size_t idx = idx0 + static_cast<std::size_t>(lane);
+        if (idx < count) {
+            const unsigned int code = transformed[idx] >= 0.0f ? 1U : 0U;
+            packed |= code << lane;
+        }
+    }
+    codes[byte_idx] = static_cast<std::uint8_t>(packed);
+}
+
+__global__ void column_tq2_lloyd_quantize_pack4_kernel(
+    const float* transformed,
+    std::uint8_t* codes,
+    int rows,
+    int cols) {
+    const std::size_t byte_idx = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const std::size_t count = static_cast<std::size_t>(rows) * cols;
+    const std::size_t idx0 = byte_idx * 4;
+    if (idx0 >= count) return;
+
+    unsigned int packed = 0;
+#pragma unroll
+    for (int lane = 0; lane < 4; ++lane) {
+        const std::size_t idx = idx0 + static_cast<std::size_t>(lane);
+        int code = 0;
+        if (idx < count) {
+            code = lloyd_tq_bucket_branchless2(transformed[idx], rows);
+        }
+        packed |= static_cast<unsigned int>(code & 0x03) << (lane * 2);
+    }
+    codes[byte_idx] = static_cast<std::uint8_t>(packed);
+}
+
 __global__ void column_tq4_lloyd_quantize_branchless_alt_kernel(
     const float* transformed,
     std::uint8_t* codes,
@@ -670,6 +751,46 @@ __global__ void column_tq4_lloyd_quantize_pack4_branchless_alt_kernel(
     codes[pair_idx] = static_cast<std::uint8_t>((code0 & 0x0f) | ((code1 & 0x0f) << 4));
 }
 
+void launch_column_tq_quantize_kernel(
+    const float* transformed,
+    std::uint8_t* codes,
+    int rows,
+    int cols,
+    int bits,
+    cudaStream_t stream) {
+    const int threads = 256;
+    const std::size_t count = static_cast<std::size_t>(rows) * cols;
+    if (bits == 1) {
+        const std::size_t byte_count = bitpacked_code_bytes(rows, cols, bits);
+        const int blocks = static_cast<int>((byte_count + threads - 1) / threads);
+        column_tq1_sign_quantize_pack8_kernel<<<blocks, threads, 0, stream>>>(
+            transformed, codes, rows, cols);
+        check_cuda(cudaGetLastError(), "launch column TQ1 sign pack8 quantize kernel");
+        return;
+    }
+    if (bits == 2) {
+        const std::size_t byte_count = bitpacked_code_bytes(rows, cols, bits);
+        const int blocks = static_cast<int>((byte_count + threads - 1) / threads);
+        column_tq2_lloyd_quantize_pack4_kernel<<<blocks, threads, 0, stream>>>(
+            transformed, codes, rows, cols);
+        check_cuda(cudaGetLastError(), "launch column TQ2 Lloyd-Max pack4 quantize kernel");
+        return;
+    }
+    if (bits == 4) {
+        const std::size_t byte_count = bitpacked_code_bytes(rows, cols, bits);
+        const int blocks = static_cast<int>((byte_count + threads - 1) / threads);
+        column_tq4_lloyd_quantize_pack4_branchless_alt_kernel<<<blocks, threads, 0, stream>>>(
+            transformed, codes, rows, cols);
+        check_cuda(cudaGetLastError(), "launch column TQ4 Lloyd-Max pack4 branchless quantize kernel");
+        return;
+    }
+
+    const int blocks = static_cast<int>((count + threads - 1) / threads);
+    column_tq_lloyd_quantize_kernel<<<blocks, threads, 0, stream>>>(
+        transformed, codes, rows, cols, bits);
+    check_cuda(cudaGetLastError(), "launch column TQ Lloyd-Max quantize kernel");
+}
+
 // (README) Column-wise Lloyd-Max centroid 解碼: 將 bit-packed bucket index 查回 rotated-domain centroid。
 __global__ void column_tq_lloyd_dequantize_kernel(
     const std::uint8_t* codes,
@@ -680,10 +801,14 @@ __global__ void column_tq_lloyd_dequantize_kernel(
     const std::size_t idx = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     const std::size_t total = static_cast<std::size_t>(rows) * cols;
     if (idx >= total) return;
-    const int code = bitpack_read_code(codes, idx, bits);
-    const TQDeviceCodebook codebook = get_tq_codebook_device(rows, bits);
-    transformed[idx] = (codebook.centroids && code >= 0 && code < codebook.levels) ?
-        codebook.centroids[code] : 0.0f;
+    const int code = bitpack_read_code_byte_aligned(codes, idx, bits);
+    if (bits == 1) {
+        transformed[idx] = tq1_centroid(rows, code);
+    } else {
+        const TQDeviceCodebook codebook = get_tq_codebook_device(rows, bits);
+        transformed[idx] = (codebook.centroids && code >= 0 && code < codebook.levels) ?
+            codebook.centroids[code] : 0.0f;
+    }
 }
 
 // (README) Column-wise TQ 反旋轉與 rescale 累加: inverse RHT 後乘回原 norm 與 D 符號並加到 accumulator。
@@ -716,10 +841,14 @@ __global__ void column_tq_lloyd_dequantize_fwht256_apply_add_kernel(
     if (row >= 256 || col >= cols) return;
 
     const std::size_t idx = static_cast<std::size_t>(col) * 256 + row;
-    const int code = bitpack_read_code(codes, idx, bits);
-    const TQDeviceCodebook codebook = get_tq_codebook_device(256, bits);
-    smem[row] = (codebook.centroids && code >= 0 && code < codebook.levels) ?
-        codebook.centroids[code] : 0.0f;
+    const int code = bitpack_read_code_byte_aligned(codes, idx, bits);
+    if (bits == 1) {
+        smem[row] = tq1_centroid(256, code);
+    } else {
+        const TQDeviceCodebook codebook = get_tq_codebook_device(256, bits);
+        smem[row] = (codebook.centroids && code >= 0 && code < codebook.levels) ?
+            codebook.centroids[code] : 0.0f;
+    }
     __syncthreads();
 
     for (int len = 1; len < 256; len <<= 1) {
@@ -764,10 +893,14 @@ __global__ void column_tq_lloyd_dequantize_fwht256_apply_store_kernel(
     if (row >= 256 || col >= cols) return;
 
     const std::size_t idx = static_cast<std::size_t>(col) * 256 + row;
-    const int code = bitpack_read_code(codes, idx, bits);
-    const TQDeviceCodebook codebook = get_tq_codebook_device(256, bits);
-    smem[row] = (codebook.centroids && code >= 0 && code < codebook.levels) ?
-        codebook.centroids[code] : 0.0f;
+    const int code = bitpack_read_code_byte_aligned(codes, idx, bits);
+    if (bits == 1) {
+        smem[row] = tq1_centroid(256, code);
+    } else {
+        const TQDeviceCodebook codebook = get_tq_codebook_device(256, bits);
+        smem[row] = (codebook.centroids && code >= 0 && code < codebook.levels) ?
+            codebook.centroids[code] : 0.0f;
+    }
     __syncthreads();
 
     for (int len = 1; len < 256; len <<= 1) {
@@ -1014,7 +1147,7 @@ QuantizeOptions make_quantize_options(
     }
     if (mode == "tq") {
         if (!is_supported_lloyd_tq_bits(bits)) {
-            throw std::runtime_error("mode=tq requires bits in [2, 8].");
+            throw std::runtime_error("mode=tq requires bits in [1, 8].");
         }
         options.mode = QuantizeMode::kTurboQuant;
         options.qjl_dim = 0;
@@ -1522,8 +1655,10 @@ DeviceCompressedBlock quantize_fp32_device_column_tq_to_device_payload(
 
     const int threads = 256;
     int blocks = static_cast<int>((count + threads - 1) / threads);
-    check_cuda(cudaMemsetAsync(d_codes, 0, block.code_bytes(), stream),
-               "cudaMemsetAsync column TQ Lloyd-Max codes");
+    if (mse_bits != 1 && mse_bits != 2 && mse_bits != 4) {
+        check_cuda(cudaMemsetAsync(d_codes, 0, block.code_bytes(), stream),
+                   "cudaMemsetAsync column TQ Lloyd-Max codes");
+    }
     if (options.mode == QuantizeMode::kTurboQuantQjl) {
         check_cuda(cudaMemsetAsync(d_qjl_signs, 0, qjl_sign_bytes(rows, cols, qjl_dim), stream),
                    "cudaMemsetAsync column tq-qjl signs");
@@ -1541,9 +1676,7 @@ DeviceCompressedBlock quantize_fp32_device_column_tq_to_device_payload(
         check_cuda(cudaGetLastError(), "launch column TQ normalize/sign kernel");
         fwht_columns_normalized_device(d_work, rows, cols, stream);
     }
-    column_tq_lloyd_quantize_kernel<<<blocks, threads, 0, stream>>>(
-        d_work, d_codes, rows, cols, mse_bits);
-    check_cuda(cudaGetLastError(), "launch column TQ Lloyd-Max quantize kernel");
+    launch_column_tq_quantize_kernel(d_work, d_codes, rows, cols, mse_bits, stream);
 
     if (options.mode == QuantizeMode::kTurboQuantQjl) {
         QjlScratchCacheEntry& qjl_scratch = get_qjl_scratch(rows, cols, qjl_dim, !d_qjl_reconstructed_ext, !d_qjl_residual_ext);
@@ -1657,8 +1790,10 @@ DeviceCompressedBlock profile_tq_column_encode_to_device_payload(
     const int blocks = static_cast<int>((count + threads - 1) / threads);
 
     check_cuda(cudaEventRecord(e_start, stream), "cudaEventRecord TQ profile encode start");
-    check_cuda(cudaMemsetAsync(d_codes, 0, block.code_bytes(), stream),
-               "cudaMemsetAsync TQ profile codes");
+    if (bits != 1 && bits != 2 && bits != 4) {
+        check_cuda(cudaMemsetAsync(d_codes, 0, block.code_bytes(), stream),
+                   "cudaMemsetAsync TQ profile codes");
+    }
     check_cuda(cudaEventRecord(e_clear, stream), "cudaEventRecord TQ profile clear");
 
     column_norms_kernel<<<cols, threads, threads * sizeof(float), stream>>>(
@@ -1678,9 +1813,7 @@ DeviceCompressedBlock profile_tq_column_encode_to_device_payload(
     }
     check_cuda(cudaEventRecord(e_transform, stream), "cudaEventRecord TQ profile transform");
 
-    column_tq_lloyd_quantize_kernel<<<blocks, threads, 0, stream>>>(
-        d_work, d_codes, rows, cols, bits);
-    check_cuda(cudaGetLastError(), "launch TQ profile quantize kernel");
+    launch_column_tq_quantize_kernel(d_work, d_codes, rows, cols, bits, stream);
     check_cuda(cudaEventRecord(e_quantize, stream), "cudaEventRecord TQ profile quantize");
     check_cuda(cudaEventSynchronize(e_quantize), "cudaEventSynchronize TQ profile encode");
 

@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=v4_tq4_n_grid
+#SBATCH --job-name=v4_tq_n_grid
 #SBATCH --account=ACD115064
 #SBATCH --partition=nycugpu_queue
 #SBATCH --nodes=1
@@ -7,8 +7,8 @@
 #SBATCH --cpus-per-task=32
 #SBATCH --gpus-per-node=8
 #SBATCH --time=01:00:00
-#SBATCH --output=tq4_none_n_grid_8gpu_%j.out
-#SBATCH --error=tq4_none_n_grid_8gpu_%j.err
+#SBATCH --output=tq_n_grid_8gpu_%j.out
+#SBATCH --error=tq_n_grid_8gpu_%j.err
 
 set -euo pipefail
 
@@ -34,6 +34,7 @@ N_STEP="${N_STEP:-16384}"
 REPEAT="${REPEAT:-5}"
 NGPUS="${NGPUS:-8}"
 GPUS_PER_RANK="${GPUS_PER_RANK:-8}"
+CHECK_B_ERROR="${CHECK_B_ERROR:-1}"
 
 COMMON_ARGS=(
     --m "${MATRIX_M}"
@@ -51,6 +52,10 @@ COMMON_ARGS=(
     --summary-only
     --no-check-error
 )
+
+if [[ "${CHECK_B_ERROR}" == "1" ]]; then
+    COMMON_ARGS+=(--check-b-error)
+fi
 
 run_case() {
     local label="$1"
@@ -74,15 +79,17 @@ run_case() {
         --repeat "${REPEAT}"
 }
 
-echo "v4 TQ4 vs NONE n-grid timing"
+echo "v4 TQ n-grid timing/error"
 echo "Host: $(hostname)"
 echo "SLURM_JOB_NODELIST=${SLURM_JOB_NODELIST}"
-echo "MATRIX_M=${MATRIX_M} N_START=${N_START} N_STOP=${N_STOP} N_STEP=${N_STEP} REPEAT=${REPEAT}"
+echo "MATRIX_M=${MATRIX_M} N_START=${N_START} N_STOP=${N_STOP} N_STEP=${N_STEP} REPEAT=${REPEAT} CHECK_B_ERROR=${CHECK_B_ERROR}"
 nvidia-smi -L
 
 for ((n = N_START; n <= N_STOP; n += N_STEP)); do
     run_case "none" "${n}" "none" 0 "none" 0
     run_case "TQ4" "${n}" "tq" 4 "tq" 4
+    run_case "TQ2" "${n}" "tq" 2 "tq" 2
+    run_case "TQ1" "${n}" "tq" 1 "tq" 1
 done
 
 echo "n-grid timing complete."

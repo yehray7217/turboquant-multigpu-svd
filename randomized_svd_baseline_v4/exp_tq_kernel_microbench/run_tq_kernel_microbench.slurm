@@ -24,20 +24,16 @@ echo "SLURM_JOB_NODELIST=${SLURM_JOB_NODELIST}"
 nvidia-smi -L
 echo "====================================="
 
-./.build/tq_kernel_microbench \
-    --rows 256 \
-    --cols 16384 \
-    --bits 4 \
-    --warmup 20 \
-    --repeat 200 \
-    --seed 1234
+for bits in 4 2 1; do
+    for cols in 16384 32768; do
+        ./.build/tq_kernel_microbench \
+            --rows 256 \
+            --cols "${cols}" \
+            --bits "${bits}" \
+            --warmup 20 \
+            --repeat 200 \
+            --seed 1234
 
-echo "====================================="
-
-./.build/tq_kernel_microbench \
-    --rows 256 \
-    --cols 32768 \
-    --bits 4 \
-    --warmup 20 \
-    --repeat 200 \
-    --seed 1234
+        echo "====================================="
+    done
+done

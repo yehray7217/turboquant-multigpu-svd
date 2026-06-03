@@ -6,6 +6,7 @@ import sys
 CASE_RE = re.compile(r"GRID_CASE method=(\S+) m=(\d+) n=(\d+) repeat=(\d+) ngpus=(\d+)")
 MEAN_RE = re.compile(r"^\s*Total Time\s+([0-9.]+)\s+ms")
 PAYLOAD_RE = re.compile(r"^\s*(Host-GPU Payload|NVLink Payload|InfiniBand Payload)\s+([0-9.]+)\s+(\S+)")
+ERROR_RE = re.compile(r"^\s*(Global B Relative Error|Local B_i Relative Error)\s+([0-9.eE+-]+)\s+%")
 
 
 def to_mib(value, unit):
@@ -48,6 +49,8 @@ def parse(path):
                     "host_gpu_mib": "",
                     "nvlink_mib": "",
                     "ib_mib": "",
+                    "global_b_rel_error_pct": "",
+                    "local_bi_rel_error_pct": "",
                 }
                 continue
             if not current:
@@ -65,6 +68,15 @@ def parse(path):
                     "InfiniBand Payload": "ib_mib",
                 }[label]
                 current[key] = to_mib(value, unit)
+                continue
+            m = ERROR_RE.match(line)
+            if m:
+                label, value = m.groups()
+                key = {
+                    "Global B Relative Error": "global_b_rel_error_pct",
+                    "Local B_i Relative Error": "local_bi_rel_error_pct",
+                }[label]
+                current[key] = float(value)
     if current:
         rows.append(current)
     return rows
@@ -72,12 +84,12 @@ def parse(path):
 
 def main():
     if len(sys.argv) != 2:
-        print("usage: summarize_n_grid.py tq4_none_n_grid_8gpu_<jobid>.out", file=sys.stderr)
+        print("usage: summarize_n_grid.py tq_n_grid_8gpu_<jobid>.out", file=sys.stderr)
         return 2
     rows = parse(sys.argv[1])
     none_by_n = {row["n"]: row for row in rows if row["method"] == "none"}
 
-    print("method,matrix_size,m,n,gpu,repeat,total_ms,speedup_vs_none,host_gpu_mib,nvlink_mib,ib_mib")
+    print("method,matrix_size,m,n,gpu,repeat,total_ms,speedup_vs_none,host_gpu_mib,nvlink_mib,ib_mib,global_b_rel_error_pct,local_bi_rel_error_pct")
     for row in rows:
         base = none_by_n.get(row["n"])
         speedup = ""
@@ -86,7 +98,8 @@ def main():
         print(
             f"{row['method']},{matrix_label(row['n'])},{row['m']},{row['n']},"
             f"{row['ngpus']},{row['repeat']},{row['total_ms']},{speedup},"
-            f"{row['host_gpu_mib']},{row['nvlink_mib']},{row['ib_mib']}"
+            f"{row['host_gpu_mib']},{row['nvlink_mib']},{row['ib_mib']},"
+            f"{row['global_b_rel_error_pct']},{row['local_bi_rel_error_pct']}"
         )
     return 0
 
