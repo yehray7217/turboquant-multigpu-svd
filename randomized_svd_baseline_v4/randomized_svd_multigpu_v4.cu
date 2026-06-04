@@ -31,6 +31,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -145,6 +146,7 @@ struct Options {
     std::string spectrum_decay_mode = "random";
     double spectrum_decay_param = 1.0;
     int spectrum_rank = 0;
+    std::string input_file;
     int repeat = 1;
     bool summary_only = false;
 };
@@ -182,6 +184,8 @@ static void print_usage(const char* prog) {
         << "  --spectrum-decay-param <float>\n"
         << "                        p for polynomial, alpha for exponential. Default: 1.0\n"
         << "  --spectrum-rank <int> Number of synthetic singular values. Default: min(m,n)\n"
+        << "  --input-file <path>   Read A from raw row-major FP32 .f32 file instead of generating synthetic A.\n"
+        << "                        File must contain exactly m*n float32 values in row-major order.\n"
         << "  --repeat <int>        Reuse setup and run the compute pipeline N times. Default: 1\n"
         << "  --summary-only        Suppress per-repeat details and print compact summaries only.\n"
         << "  --no-check-error      Skip final reconstruction error metric.\n"
@@ -217,6 +221,7 @@ static Options parse_args(int argc, char** argv) {
         else if (a == "--spectrum-decay-mode") opt.spectrum_decay_mode = need_value(a);
         else if (a == "--spectrum-decay-param") opt.spectrum_decay_param = std::stod(need_value(a));
         else if (a == "--spectrum-rank") opt.spectrum_rank = std::stoi(need_value(a));
+        else if (a == "--input-file") opt.input_file = need_value(a);
         else if (a == "--summary-only") opt.summary_only = true;
         else if (a == "--no-check-error") opt.check_error = false;
         else if (a == "--check-b-error") opt.check_b_error = true;
@@ -246,6 +251,9 @@ static Options parse_args(int argc, char** argv) {
     }
     if (opt.spectrum_rank < 0) {
         throw std::runtime_error("spectrum-rank must be non-negative.");
+    }
+    if (!opt.input_file.empty() && opt.device_random_input) {
+        throw std::runtime_error("--input-file is incompatible with --device-random-input in the first file-input implementation.");
     }
     if (opt.k + opt.oversample > std::min(opt.m, opt.n)) {
         throw std::runtime_error("Require k + oversample <= min(m, n).");
@@ -292,6 +300,107 @@ static int checked_mpi_count(std::size_t count, const char* label) {
         throw std::runtime_error(std::string(label) + " exceeds MPI int count limit.");
     }
     return static_cast<int>(count);
+}
+
+static std::uint64_t checked_input_file_bytes(int m, int n) {
+    const std::uint64_t rows = static_cast<std::uint64_t>(m);
+    const std::uint64_t cols = static_cast<std::uint64_t>(n);
+    const std::uint64_t elem_bytes = static_cast<std::uint64_t>(sizeof(float));
+    if (rows != 0 && cols > std::numeric_limits<std::uint64_t>::max() / rows) {
+        throw std::runtime_error("m*n overflows uint64_t while checking input file size.");
+    }
+    const std::uint64_t elems = rows * cols;
+    if (elems > std::numeric_limits<std::uint64_t>::max() / elem_bytes) {
+        throw std::runtime_error("m*n*sizeof(float) overflows uint64_t while checking input file size.");
+    }
+    return elems * elem_bytes;
+}
+
+static std::uint64_t input_file_size_bytes(const std::string& path) {
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f) {
+        throw std::runtime_error("Failed to open input file: " + path);
+    }
+    const std::streampos pos = f.tellg();
+    if (pos == std::streampos(-1)) {
+        throw std::runtime_error("Failed to determine input file size: " + path);
+    }
+    return static_cast<std::uint64_t>(pos);
+}
+
+static void validate_input_file_size(const std::string& path, int m, int n) {
+    const std::uint64_t expected = checked_input_file_bytes(m, n);
+    const std::uint64_t actual = input_file_size_bytes(path);
+    if (actual != expected) {
+        std::ostringstream oss;
+        oss << "Input file size mismatch for " << path
+            << ": expected " << expected << " bytes for "
+            << m << "x" << n << " raw FP32 row-major matrix, got "
+            << actual << " bytes.";
+        throw std::runtime_error(oss.str());
+    }
+}
+
+static std::vector<float> read_rowmajor_f32_block(
+    const std::string& path,
+    int n,
+    int row0,
+    int mi) {
+    const std::uint64_t offset_bytes =
+        static_cast<std::uint64_t>(row0) *
+        static_cast<std::uint64_t>(n) *
+        static_cast<std::uint64_t>(sizeof(float));
+    const std::uint64_t read_bytes =
+        static_cast<std::uint64_t>(mi) *
+        static_cast<std::uint64_t>(n) *
+        static_cast<std::uint64_t>(sizeof(float));
+    if (offset_bytes > static_cast<std::uint64_t>(std::numeric_limits<std::streamoff>::max()) ||
+        read_bytes > static_cast<std::uint64_t>(std::numeric_limits<std::streamsize>::max())) {
+        throw std::runtime_error("Input row block is too large for std::ifstream offsets.");
+    }
+
+    std::vector<float> rowmajor(static_cast<std::size_t>(mi) * n);
+    if (read_bytes == 0) return rowmajor;
+
+    std::ifstream f(path, std::ios::binary);
+    if (!f) {
+        throw std::runtime_error("Failed to open input file: " + path);
+    }
+    f.seekg(static_cast<std::streamoff>(offset_bytes), std::ios::beg);
+    if (!f) {
+        throw std::runtime_error("Failed to seek input file row block: " + path);
+    }
+    f.read(reinterpret_cast<char*>(rowmajor.data()), static_cast<std::streamsize>(read_bytes));
+    if (f.gcount() != static_cast<std::streamsize>(read_bytes)) {
+        std::ostringstream oss;
+        oss << "Short read from input file " << path
+            << ": expected " << read_bytes << " bytes at offset "
+            << offset_bytes << ", got " << f.gcount() << " bytes.";
+        throw std::runtime_error(oss.str());
+    }
+    return rowmajor;
+}
+
+static std::vector<float> rowmajor_to_colmajor(
+    const std::vector<float>& rowmajor,
+    int rows,
+    int cols) {
+    std::vector<float> colmajor(static_cast<std::size_t>(rows) * cols);
+    for (int row = 0; row < rows; ++row) {
+        for (int col = 0; col < cols; ++col) {
+            colmajor[static_cast<std::size_t>(col) * rows + row] =
+                rowmajor[static_cast<std::size_t>(row) * cols + col];
+        }
+    }
+    return colmajor;
+}
+
+static double rowmajor_norm2(const std::vector<float>& rowmajor) {
+    long double norm2 = 0.0L;
+    for (float x : rowmajor) {
+        norm2 += static_cast<long double>(x) * static_cast<long double>(x);
+    }
+    return static_cast<double>(norm2);
 }
 
 struct MpiRuntime {
@@ -729,12 +838,17 @@ int main(int argc, char** argv) {
         const int n = opt.n;
         const int k = opt.k;
         const int l = opt.k + opt.oversample;
-        const bool use_spectrum_decay = opt.spectrum_decay_mode != "random";
-        if (opt.spectrum_rank == 0) {
-            opt.spectrum_rank = std::min(m, n);
-        }
-        if (opt.spectrum_rank > std::min(m, n)) {
-            throw std::runtime_error("spectrum-rank must be <= min(m, n).");
+        const bool use_input_file = !opt.input_file.empty();
+        const bool use_spectrum_decay = !use_input_file && opt.spectrum_decay_mode != "random";
+        if (use_input_file) {
+            validate_input_file_size(opt.input_file, m, n);
+        } else {
+            if (opt.spectrum_rank == 0) {
+                opt.spectrum_rank = std::min(m, n);
+            }
+            if (opt.spectrum_rank > std::min(m, n)) {
+                throw std::runtime_error("spectrum-rank must be <= min(m, n).");
+            }
         }
         const std::vector<int> global_rows = split_rows(m, global_ngpus);
         const std::vector<int> global_row0 = prefix_offsets(global_rows);
@@ -750,9 +864,24 @@ int main(int argc, char** argv) {
         }
 
         if (is_root) {
+            if (use_input_file &&
+                (opt.spectrum_decay_mode != "random" ||
+                 opt.spectrum_decay_param != 1.0 ||
+                 opt.spectrum_rank != 0)) {
+                std::cerr << "Warning: --input-file is set; synthetic spectrum options are ignored.\n";
+            }
+            const std::string matrix_source = use_input_file ?
+                "file" :
+                (use_spectrum_decay ? "synthetic_spectrum" :
+                 (opt.device_random_input ? "device_random" : "host_random"));
             std::cout << "Randomized multi-GPU SVD baseline v4 (MPI TSQR/distributed B + optional subspace iteration)\n"
                       << "  m=" << m << " n=" << n << " k=" << k
                       << " oversample=" << opt.oversample << " l=" << l
+                      << " matrix_source=" << matrix_source;
+            if (use_input_file) {
+                std::cout << " input_file=" << opt.input_file;
+            }
+            std::cout
                       << " mpi_size=" << mpi.size
                       << " local_gpus_per_rank=" << opt.ngpus
                       << " global_ngpus=" << global_ngpus
@@ -780,7 +909,9 @@ int main(int argc, char** argv) {
         double h_A_norm2 = 0.0;
         {
             NvtxRange range("init_host_random");
-            if (!opt.device_random_input) {
+            if (use_input_file) {
+                h_Omega = make_random_matrix(n, l, opt.seed + 1, 1.0f);
+            } else if (!opt.device_random_input) {
                 if (!use_spectrum_decay) {
                     h_A_blocks = make_random_row_blocks(
                         rows, n, opt.seed, 1.0f / std::sqrt(static_cast<float>(m)), &h_A_norm2);
@@ -1110,6 +1241,40 @@ int main(int argc, char** argv) {
         }
         double t_allocate_gpu_buffers_ms = timer.toc_ms();
 
+        double t_load_input_file_ms = 0.0;
+        if (use_input_file) {
+            timer.tic();
+            NvtxRange range("load_input_file_matrix");
+            long double local_norm2 = 0.0L;
+            for (int g = 0; g < opt.ngpus; ++g) {
+                DeviceWork& w = works[g];
+                std::vector<float> h_Ai_rowmajor =
+                    read_rowmajor_f32_block(opt.input_file, n, w.row0, w.mi);
+                local_norm2 += static_cast<long double>(rowmajor_norm2(h_Ai_rowmajor));
+                std::vector<float> h_Ai_colmajor =
+                    rowmajor_to_colmajor(h_Ai_rowmajor, w.mi, n);
+                CHECK_CUDA(cudaSetDevice(w.dev));
+                CHECK_CUDA(cudaMemcpy(
+                    w.d_Ai,
+                    h_Ai_colmajor.data(),
+                    static_cast<size_t>(w.mi) * n * sizeof(float),
+                    cudaMemcpyHostToDevice));
+            }
+            for (int g = 0; g < opt.ngpus; ++g) {
+                CHECK_CUDA(cudaSetDevice(works[g].dev));
+                CHECK_CUDA(cudaDeviceSynchronize());
+            }
+            const double local_norm2_double = static_cast<double>(local_norm2);
+            CHECK_MPI(MPI_Allreduce(
+                &local_norm2_double,
+                &h_A_norm2,
+                1,
+                MPI_DOUBLE,
+                MPI_SUM,
+                MPI_COMM_WORLD));
+            t_load_input_file_ms = timer.toc_ms();
+        }
+
         double t_generate_test_matrix_ms = 0.0;
         if (use_spectrum_decay) {
             timer.tic();
@@ -1151,7 +1316,7 @@ int main(int argc, char** argv) {
             t_generate_test_matrix_ms = timer.toc_ms();
         }
         double t_setup_gpu_resources_ms =
-            t_create_gpu_handles_ms + t_allocate_gpu_buffers_ms + t_generate_test_matrix_ms;
+            t_create_gpu_handles_ms + t_allocate_gpu_buffers_ms + t_generate_test_matrix_ms + t_load_input_file_ms;
 
         std::vector<double> repeat_total_ms;
         std::vector<double> repeat_gpu_compute_ms;
@@ -1261,7 +1426,7 @@ int main(int argc, char** argv) {
         const std::vector<std::vector<float>>* h_A_blocks_src = &h_A_blocks;
         const std::vector<float>* h_Omega_src = &h_Omega;
         if (!opt.device_random_input && vary_seed_per_repeat) {
-            if (!use_spectrum_decay) {
+            if (!use_input_file && !use_spectrum_decay) {
                 h_A_blocks_repeat = make_random_row_blocks(
                     rows, n, repeat_seed, 1.0f / std::sqrt(static_cast<float>(m)), nullptr);
                 h_A_blocks_src = &h_A_blocks_repeat;
@@ -1353,7 +1518,7 @@ int main(int argc, char** argv) {
                         w.d_Omega, n, l, 0, repeat_seed + 1, std::sqrt(3.0f));
                     CHECK_CUDA(cudaGetLastError());
                 } else {
-                    if (!use_spectrum_decay) {
+                    if (!use_input_file && !use_spectrum_decay) {
                         timed_host_copy(w.d_Ai, (*h_A_blocks_src)[g].data(), static_cast<size_t>(w.mi) * n * sizeof(float), cudaMemcpyHostToDevice);
                     }
                     timed_host_copy(w.d_Omega, h_Omega_src->data(), static_cast<size_t>(n) * l * sizeof(float), cudaMemcpyHostToDevice);
@@ -1374,7 +1539,7 @@ int main(int argc, char** argv) {
                 CHECK_CUDA(cudaSetDevice(g));
                 CHECK_CUDA(cudaDeviceSynchronize());
             }
-            if (opt.check_error && !use_spectrum_decay) {
+            if (opt.check_error && !use_input_file && !use_spectrum_decay) {
                 Timer diagnostic_timer;
                 diagnostic_timer.tic();
                 double local_A_norm2 = 0.0;
@@ -3113,11 +3278,13 @@ int main(int argc, char** argv) {
                         "%");
                 }
                 if (opt.check_error) {
-                    const double theoretical_error = synthetic_spectrum_theoretical_error(
-                        opt.spectrum_decay_mode,
-                        opt.spectrum_decay_param,
-                        opt.spectrum_rank,
-                        k);
+                    const double theoretical_error = use_input_file ?
+                        -1.0 :
+                        synthetic_spectrum_theoretical_error(
+                            opt.spectrum_decay_mode,
+                            opt.spectrum_decay_param,
+                            opt.spectrum_rank,
+                            k);
                     std::cout <<  std::setw(label_width) << std::right << ""
                               <<  std::setw(16) << std::right << "mean"
                               <<  std::setw(16) << std::right << "min"
