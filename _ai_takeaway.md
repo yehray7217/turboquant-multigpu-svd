@@ -57,6 +57,9 @@ turboquant-multigpu-svd/
 │   ├── exp_subspace_iteration/         experiment: does subspace iteration pay for itself?
 │   ├── exp_subspace_stabilization/     experiment: QR-stabilized Z (negative result)
 │   └── skills/                         PROJECT_CONTEXT.md + EXPERIMENT_GUIDELINE.md (AI/teammate handoff)
+├── graph_embedding_benchmark/ NEW: GraphSAGE-style node embedding exchange proxy
+│   ├── graph_embedding_comm_benchmark.cu fixed-input MPI/CUDA Allgather benchmark
+│   └── run_graph_embedding_comm_8gpu.slurm 8-GPU sweep: none/lowbit8/tq4/tq-qjl4
 ├── turboquant/             Shared compression kernel library (TQ + QJL CUDA kernels)
 ├── slate_baseline/         SLATE library naive randomized SVD (library-level reference)
 ├── benchmark_compare/      Scripts to compare cuSOLVER vs SLATE vs v2 side-by-side
@@ -109,6 +112,13 @@ turboquant-multigpu-svd/
 - **SLATE naive baseline**:
   - Unoptimized SLATE R(randomized)SVD with `Lookahead=0`, `nb=256`.
   - Serves as library distributed randomized SVD reference.
+
+- **Graph embedding exchange benchmark**:
+  - Synthetic Distributed GraphSAGE/PyG/DGL communication proxy.
+  - Fixed default input: `halo_nodes=65536`, `embedding_dim=256`, FP32 payload = 64 MiB/rank.
+  - Compares `none`, `lowbit8`, `tq4`, and `tq-qjl4` on the same cross-rank embedding Allgather.
+  - Use this to argue that the project generalizes from SVD/PCA intermediate matrices to GNN hidden embedding exchange.
+  - Caveat: this is not an end-to-end DGL/PyG trainer or `ogbn-papers100M` result.
 
 ### Compression Modes Implemented (in `turboquant/`)
 
@@ -277,6 +287,7 @@ Requires significant rewrite. Lower priority than fixing QJL.
 | `randomized_svd_baseline_v3/README.md` | Current final claims and result tables                 |
 | `randomized_svd_baseline_v4/skills/PROJECT_CONTEXT.md` | Latest v4 status: subspace iteration, synthetic spectra, RHT |
 | `turboquant/turboquant.hpp`            | Public API for all compression modes                   |
+| `graph_embedding_benchmark/README.md`  | GNN embedding exchange proxy benchmark and fixed input |
 | `randomized_svd_baseline_v2/README.md` | Compression options, timing policy, profiling guide    |
 | `docs/notes/Randomized_SVD.md`         | Algorithm theory with pseudocode                       |
 
@@ -295,6 +306,10 @@ cd randomized_svd_baseline_v3 && make
 
 # cuSOLVER baseline
 cd cusolver && make
+
+# GNN embedding exchange proxy
+module load cuda/12.8 ucx/1.14.1 openmpi/5.0.2_ucx1.14.1_cuda12.3
+cd graph_embedding_benchmark && make
 ```
 
 ## Run Quick Reference
@@ -308,4 +323,7 @@ sbatch randomized_svd_baseline_v2/run_randomized_svd_multigpu_v2_tq_bit_curve.sl
 
 # Side-by-side benchmark comparison
 sbatch benchmark_compare/run_compare_svd_2gpu.slurm
+
+# Fixed-input GraphSAGE-style embedding communication sweep
+sbatch graph_embedding_benchmark/run_graph_embedding_comm_8gpu.slurm
 ```
