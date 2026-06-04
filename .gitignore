@@ -52,3 +52,12 @@ slate_baseline/*.d
 slate_baseline/slate-rsvd-naive-*.out
 slate_baseline/background_setup.log
 slate_baseline/background_setup.pid
+
+# graph_embedding_benchmark
+graph_embedding_benchmark/.build/
+graph_embedding_benchmark/data/
+graph_embedding_benchmark/results/
+graph_embedding_benchmark/__pycache__/
+graph_embedding_benchmark/*.out
+graph_embedding_benchmark/*.err
+
