@@ -254,6 +254,25 @@ netCDF4
 numpy
 ```
 
+#### Recommended download method
+
+Do not manually download files. Write a Python script using `xarray` and NOAA PSL OPeNDAP:
+
+    import xarray as xr
+
+    years = range(2000, 2023)
+    urls = [
+        f"https://psl.noaa.gov/thredds/dodsC/Datasets/noaa.oisst.v2.highres/sst.day.mean.{y}.nc"
+        for y in years
+    ]
+
+    ds = xr.open_mfdataset(urls, combine="by_coords")
+    sst = ds["sst"]
+
+The preprocessing script should download/read the data, select valid ocean grid points and days, remove temporal mean per grid point, and write `matrix.f32`.
+
+Do not download data inside Slurm benchmark jobs. Data preparation is an offline preprocessing step.
+
 ---
 
 ### Step 2：選時間範圍
