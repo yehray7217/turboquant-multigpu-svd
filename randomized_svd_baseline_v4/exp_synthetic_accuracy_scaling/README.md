@@ -57,7 +57,7 @@ The scripts run two phases for each config:
 
 ```text
 run_accuracy_sweep.slurm  -> p = 0.4, 0.6, 0.8, 1.0 at 32768 x 8192
-run_scaling.slurm         -> 16384 x 4096 at p = 0.6
+run_scaling.slurm         -> 16384 x 4096, 65536 x 16384, 131072 x 32768 at p = 0.6
 ```
 
 The `32768 x 8192, p=0.6` scaling point is reused from the accuracy sweep. Set `RUN_DUPLICATE_32K=1` when submitting `run_scaling.slurm` only if that duplicate point needs to be rerun.
@@ -89,6 +89,12 @@ The `32768 x 8192, p=0.6` scaling point is reused from the accuracy sweep. Set `
 | 32768 x 8192 | No TQ | | 1.00x | | | | | 1.000 |
 | 32768 x 8192 | TQ8 | | | | | | | |
 | 32768 x 8192 | TQ4 | | | | | | | |
+| 65536 x 16384 | No TQ | | 1.00x | | | | | 1.000 |
+| 65536 x 16384 | TQ8 | | | | | | | |
+| 65536 x 16384 | TQ4 | | | | | | | |
+| 131072 x 32768 | No TQ | | 1.00x | | | | | 1.000 |
+| 131072 x 32768 | TQ8 | | | | | | | |
+| 131072 x 32768 | TQ4 | | | | | | | |
 
 ## Notes
 
@@ -96,3 +102,4 @@ The `32768 x 8192, p=0.6` scaling point is reused from the accuracy sweep. Set `
 - Do not include QJL in this experiment.
 - Use summary output values, not manually estimated values from long logs.
 - For timing, use warm summary means and payload summaries from the `Timing Summary` / `Payload Summary` sections.
+- Keep `k=250`, `oversample=6`, and `l=256` fixed for matrix-size scaling. This keeps the scaling curve focused on matrix size only; experiments that vary `l` should be separate.
