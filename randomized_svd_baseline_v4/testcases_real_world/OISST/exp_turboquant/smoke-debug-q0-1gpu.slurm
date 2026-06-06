@@ -1,15 +1,15 @@
 #!/bin/bash
 # Paths are set for /work/pbr03617.
-#SBATCH --job-name=rsvd_v4_oisst_smoke
+#SBATCH --job-name=rsvd_v4_oisst_q0_1gpu
 #SBATCH --account=ACD115064
 #SBATCH --partition=nycugpu_queue
-#SBATCH --nodes=2
+#SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=32
-#SBATCH --gpus-per-node=8
+#SBATCH --cpus-per-task=4
+#SBATCH --gpus-per-node=1
 #SBATCH --time=01:00:00
-#SBATCH --output=/work/pbr03617/turboquant-multigpu-svd/randomized_svd_baseline_v4/testcases_real_world/OISST/exp_turboquant/output_logs/smoke-debug.out
-#SBATCH --error=/work/pbr03617/turboquant-multigpu-svd/randomized_svd_baseline_v4/testcases_real_world/OISST/exp_turboquant/error_logs/smoke-debug.err
+#SBATCH --output=/work/pbr03617/turboquant-multigpu-svd/randomized_svd_baseline_v4/testcases_real_world/OISST/exp_turboquant/output_logs/smoke-debug-q0-1gpu.out
+#SBATCH --error=/work/pbr03617/turboquant-multigpu-svd/randomized_svd_baseline_v4/testcases_real_world/OISST/exp_turboquant/error_logs/smoke-debug-q0-1gpu.err
 
 set -euo pipefail
 
@@ -27,7 +27,7 @@ cd "$PROJECT_ROOT"
 make
 cd "${PROJECT_ROOT}/testcases_real_world/OISST/exp_turboquant"
 
-echo "Starting OISST smoke test on matrix_debug.f32"
+echo "Starting OISST q0 1GPU smoke test on matrix_debug.f32"
 echo "Date: $(date)"
 echo "Host: $(hostname)"
 echo "SLURM_JOB_NODELIST=${SLURM_JOB_NODELIST}"
@@ -39,11 +39,11 @@ srun --mpi=pmix "$BIN" \
     --n 4096 \
     --k 250 \
     --oversample 6 \
-    --ngpus 16 \
-    --gpus-per-rank 8 \
+    --ngpus 1 \
+    --gpus-per-rank 1 \
     --seed 1234 \
     --input-file ../matrix_debug.f32 \
-    --subspace-iter 1 \
+    --subspace-iter 0 \
     --skip-form-u \
     --compress-b-mode none \
     --compress-b-bits 0 \
@@ -52,4 +52,4 @@ srun --mpi=pmix "$BIN" \
     --summary-only \
     --repeat 50
 
-echo "OISST smoke test complete!"
+echo "OISST q0 1GPU smoke test complete!"

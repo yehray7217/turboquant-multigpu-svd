@@ -85,6 +85,38 @@ The script prints:
 - row-mean residual statistics
 - file size check
 
+For an independent SVD sanity check, run this in a Python environment with
+NumPy installed:
+
+```bash
+python3 scripts/check_oisst_svd.py \
+    --file matrix_debug.f32 \
+    --m 8192 \
+    --n 4096 \
+    --k 250 \
+    --sample-rows 4096 \
+    --sample-cols 2048 \
+    --work-dtype float32
+```
+
+To also run a full blockwise randomized SVD check:
+
+```bash
+python3 scripts/check_oisst_svd.py \
+    --file matrix_debug.f32 \
+    --m 8192 \
+    --n 4096 \
+    --k 250 \
+    --full-randomized \
+    --oversample 6 \
+    --n-iter 1 \
+    --work-dtype float32 \
+    --repeat 50
+```
+
+Use `--work-dtype float32` to better match the CUDA rSVD implementation.
+The randomized check reports mean/min/stddev when `--repeat` is greater than 1.
+
 ## Benchmark Commands
 
 The `exp_turboquant/` folder contains:

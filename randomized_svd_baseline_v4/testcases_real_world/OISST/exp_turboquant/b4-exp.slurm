@@ -1,5 +1,5 @@
 #!/bin/bash
-# Update the absolute paths below if your clone is not under /home/rax10101010/hpc_final/.
+# Paths are set for /work/pbr03617.
 #SBATCH --job-name=rsvd_v4_oisst_tq4
 #SBATCH --account=ACD115064
 #SBATCH --partition=nycugpu_queue
@@ -8,8 +8,8 @@
 #SBATCH --cpus-per-task=32
 #SBATCH --gpus-per-node=8
 #SBATCH --time=01:00:00
-#SBATCH --output=/home/rax10101010/hpc_final/turboquant-multigpu-svd/randomized_svd_baseline_v4/testcases_real_world/OISST/exp_turboquant/output_logs/b4-exp.out
-#SBATCH --error=/home/rax10101010/hpc_final/turboquant-multigpu-svd/randomized_svd_baseline_v4/testcases_real_world/OISST/exp_turboquant/error_logs/b4-exp.err
+#SBATCH --output=/work/pbr03617/turboquant-multigpu-svd/randomized_svd_baseline_v4/testcases_real_world/OISST/exp_turboquant/output_logs/b4-exp.out
+#SBATCH --error=/work/pbr03617/turboquant-multigpu-svd/randomized_svd_baseline_v4/testcases_real_world/OISST/exp_turboquant/error_logs/b4-exp.err
 
 set -euo pipefail
 
@@ -20,7 +20,7 @@ module load openmpi/5.0.2_ucx1.14.1_cuda12.3
 unset OMPI_MCA_opal_cuda_support || true
 unset OMPI_MCA_btl_smcuda_use_cuda_ipc || true
 
-PROJECT_ROOT=/home/rax10101010/hpc_final/turboquant-multigpu-svd/randomized_svd_baseline_v4
+PROJECT_ROOT=/work/pbr03617/turboquant-multigpu-svd/randomized_svd_baseline_v4
 BIN="${PROJECT_ROOT}/.build/randomized_svd_multigpu_v4"
 cd "$PROJECT_ROOT"
 

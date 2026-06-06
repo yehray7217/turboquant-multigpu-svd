@@ -295,6 +295,24 @@ static std::vector<int> prefix_offsets(const std::vector<int>& rows) {
     return offsets;
 }
 
+static void stitch_rank_major_column_stacks(
+    const std::vector<float>& gathered,
+    std::vector<float>& global_colmajor,
+    int mpi_size,
+    int local_rows,
+    int cols) {
+    const int global_rows = mpi_size * local_rows;
+    for (int rank = 0; rank < mpi_size; ++rank) {
+        const float* rank_block =
+            gathered.data() + static_cast<size_t>(rank) * local_rows * cols;
+        for (int col = 0; col < cols; ++col) {
+            const float* src = rank_block + static_cast<size_t>(col) * local_rows;
+            float* dst = global_colmajor.data() + static_cast<size_t>(col) * global_rows + rank * local_rows;
+            std::copy(src, src + local_rows, dst);
+        }
+    }
+}
+
 static int checked_mpi_count(std::size_t count, const char* label) {
     if (count > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
         throw std::runtime_error(std::string(label) + " exceeds MPI int count limit.");
@@ -1667,18 +1685,30 @@ int main(int argc, char** argv) {
             CHECK_CUDA(cudaSetDevice(0));
 
             if (!use_single_rank_packed_device_tsqr) {
+                std::vector<float> h_Rstack_gathered;
+                if (is_root) {
+                    h_Rstack_gathered.resize(static_cast<size_t>(r_rows) * l);
+                }
                 // Inter-node / InfiniBand-like TSQR metadata gather.
                 timed_mpi([&]() {
                     return MPI_Gather(
                         h_Rstack_local.data(),
                         local_r_rows * l,
                         MPI_FLOAT,
-                        is_root ? h_Rstack.data() : nullptr,
+                        is_root ? h_Rstack_gathered.data() : nullptr,
                         local_r_rows * l,
                         MPI_FLOAT,
                         0,
                         MPI_COMM_WORLD);
                 }, static_cast<unsigned long long>(local_r_rows) * l * sizeof(float));
+                if (is_root) {
+                    stitch_rank_major_column_stacks(
+                        h_Rstack_gathered,
+                        h_Rstack,
+                        mpi.size,
+                        local_r_rows,
+                        l);
+                }
             }
 
             if (is_root) {
@@ -2200,18 +2230,30 @@ int main(int argc, char** argv) {
 
                 CHECK_CUDA(cudaSetDevice(0));
                 if (!use_single_rank_packed_device_tsqr) {
+                    std::vector<float> h_Rstack_gathered;
+                    if (is_root) {
+                        h_Rstack_gathered.resize(static_cast<size_t>(r_rows) * l);
+                    }
                     // Inter-node / InfiniBand-like TSQR metadata gather inside subspace iteration.
                     timed_mpi([&]() {
                         return MPI_Gather(
                             h_Rstack_local.data(),
                             local_r_rows * l,
                             MPI_FLOAT,
-                            is_root ? h_Rstack.data() : nullptr,
+                            is_root ? h_Rstack_gathered.data() : nullptr,
                             local_r_rows * l,
                             MPI_FLOAT,
                             0,
                             MPI_COMM_WORLD);
                     }, static_cast<unsigned long long>(local_r_rows) * l * sizeof(float));
+                    if (is_root) {
+                        stitch_rank_major_column_stacks(
+                            h_Rstack_gathered,
+                            h_Rstack,
+                            mpi.size,
+                            local_r_rows,
+                            l);
+                    }
                 }
 
                 if (is_root) {
