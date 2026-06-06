@@ -1,0 +1,11 @@
+matrix*.f32
+meta*.json
+raw_data/
+cache/
+hf_cache/
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.npy
+*.npz
