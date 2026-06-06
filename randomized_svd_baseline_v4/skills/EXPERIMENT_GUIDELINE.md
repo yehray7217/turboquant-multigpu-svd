@@ -40,6 +40,8 @@ q1_exp.slurm
 q2_exp.slurm
 tq4_exp.slurm
 tq2_exp.slurm
+run_accuracy_sweep.slurm
+run_scaling.slurm
 ```
 
 Avoid vague names like:
@@ -82,6 +84,7 @@ Important notes:
 - Timing runs skip the first cold run internally.
 - Accuracy runs use all 50 randomized trials with different seeds.
 - `spectrum-decay-param = 0.6` is the recommended first-pass stress-test setting.
+- `device-random-input` is recommended for synthetic experiments, but it must not be used with `--input-file`.
 
 Recommended polynomial decay sweep:
 
@@ -109,7 +112,16 @@ Every experiment usually has two `srun` phases:
    --repeat 50
    ```
 
-The timing phase should report only `Total Time`.
+The timing phase reports runtime and communication summaries:
+
+```text
+Total Time
+GPU Compute Time
+Host/Staging Time
+NVLink Time
+InfiniBand Time
+payload summaries
+```
 
 The final-error phase should report:
 
@@ -127,6 +139,8 @@ Final Reconstruction Error:
 ```bash
 --check-b-error
 ```
+
+For real-world `--input-file` runs, `theoretical` and `err ratio` are `n/a`. Use raw `Final Reconstruction Error` and the difference from the no-compression baseline.
 
 ## 4. Metrics to Record
 
@@ -157,6 +171,17 @@ If compression is enabled and detailed logs are needed, also record:
 | payload bytes / MiB | Actual transmitted payload |
 | compression ratio | FP32 payload size divided by compressed payload size |
 | `B Relative Error` | Optional diagnostic error caused by compressing/decompressing `B_i`; enable with `--check-b-error` |
+
+For real-world input-file experiments:
+
+| Metric | Source | Meaning |
+|---|---|---|
+| `Final Error mean` | Final-error phase | Main raw accuracy metric |
+| `Delta vs No TQ` | Derived | TQ final error minus no-compression final error |
+| `Total Time mean` | Timing phase | Main runtime metric |
+| payload bytes / MiB | Timing phase | Communication payload reduction |
+
+Do not report `Error Ratio` as the main real-world metric unless the true singular spectrum was computed separately.
 
 ## 5. README Format
 
@@ -199,7 +224,7 @@ When filling the table:
 - Prefer `Error Ratio` for final accuracy interpretation.
 - Keep notes concise and grounded in the actual logs.
 
-## 6. Recommended TQ Experiment
+## 6. Recommended Synthetic TQ Experiment
 
 This is the next important experiment family.
 
@@ -212,7 +237,7 @@ Measure whether TurboQuant improves runtime without unacceptable final reconstru
 Suggested folder:
 
 ```text
-exp_tq_b_reduce/
+exp_synthetic_accuracy_scaling/
 ```
 
 Fixed config:
@@ -229,32 +254,88 @@ subspace-iter = 1
 repeat = 50
 ```
 
-Initial B-only comparison:
+Main comparison:
 
 | Group | `compress-b-mode` | `compress-b-bits` | `compress-subspace-mode` | `compress-subspace-bits` |
 |---|---|---:|---|---:|
 | control | `none` | `0` | `none` | `0` |
-| B-only TQ 4-bit | `tq` | `4` | `none` | `0` |
-| B-only TQ 2-bit | `tq` | `2` | `none` | `0` |
-
-Follow-up subspace-side comparison:
-
-| Group | `compress-b-mode` | `compress-b-bits` | `compress-subspace-mode` | `compress-subspace-bits` |
-|---|---|---:|---|---:|
-| control | `none` | `0` | `none` | `0` |
-| subspace-only TQ 4-bit | `none` | `0` | `tq` | `4` |
-| B + subspace TQ 4-bit | `tq` | `4` | `tq` | `4` |
-| B + subspace TQ 2-bit | `tq` | `2` | `tq` | `2` |
+| TQ 8-bit | `tq` | `8` | `tq` | `8` |
+| TQ 4-bit | `tq` | `4` | `tq` | `4` |
 
 Expected interpretation:
 
-- TQ 4-bit is likely the best tradeoff.
-- TQ 2-bit may be faster but can damage accuracy.
-- With `subspace-iter = 1`, B-only TQ may not produce full speedup because the subspace iteration `Z` communication can be comparable to the `B` reduce.
-- Use `compress-subspace-*` only when explicitly studying subspace-side compression.
-- Start with `p=0.6`; if time allows, sweep `p=0.4, 0.6, 0.8, 1.0`.
+- TQ 8-bit is the safest current default.
+- TQ 4-bit may be faster but can visibly increase error.
+- With `subspace-iter = 1`, compress both B and subspace Z for the main TQ comparison.
+- Do not include QJL unless explicitly requested; current QJL experiments are negative.
+- Sweep `p=0.4, 0.6, 0.8, 1.0`.
 
-## 7. Recommended Subspace Iteration Settings
+Recommended scripts:
+
+```text
+run_accuracy_sweep.slurm  -> p = 0.4, 0.6, 0.8, 1.0 at 32768 x 8192
+run_scaling.slurm         -> 16384 x 4096 at p = 0.6
+```
+
+Derived metrics:
+
+```text
+Speedup = Total Time_NoTQ / Total Time_TQ
+Error Inflation = Error Ratio_TQ / Error Ratio_NoTQ
+```
+
+Reuse the `32768 x 8192, p=0.6` accuracy-sweep point in the scaling table unless rerun is necessary.
+
+## 7. Real-World Input-File Experiments
+
+v4 supports external raw FP32 matrices:
+
+```bash
+--input-file <path>
+```
+
+Input file requirements:
+
+```text
+raw float32 binary
+row-major
+no header
+file size = m * n * sizeof(float)
+```
+
+Important rules:
+
+- Shape still comes from `--m` and `--n`.
+- Do not use `--device-random-input` with `--input-file`.
+- File loading is setup work and should not be interpreted as `Total Time`.
+- Repeat runs keep A fixed and only change randomized SVD Omega.
+- `theoretical` and `err ratio` are `n/a` unless the true singular spectrum is computed separately.
+
+Current real-world testcase guideline folders:
+
+```text
+testcases_real_world/OISST/guideline.md
+testcases_real_world/POD/guideline.md
+testcases_real_world/LoftQ/guideline.md
+```
+
+Recommended real-world experiment comparison:
+
+| Group | `compress-b-mode` | `compress-b-bits` | `compress-subspace-mode` | `compress-subspace-bits` |
+|---|---|---:|---|---:|
+| control | `none` | `0` | `none` | `0` |
+| TQ 8-bit | `tq` | `8` | `tq` | `8` |
+| TQ 4-bit | `tq` | `4` | `tq` | `4` |
+
+Suggested real-world README result table:
+
+| Output | Group | Matrix | Total Time Mean (ms) | Final Error Mean | Delta vs No TQ | Notes |
+|---|---|---|---:|---:|---:|---|
+| ctrl.out | control | TBD | TBD | TBD | 0 |  |
+| b8-exp.out | TQ8 | TBD | TBD | TBD | TBD |  |
+| b4-exp.out | TQ4 | TBD | TBD | TBD | TBD |  |
+
+## 8. Recommended Subspace Iteration Settings
 
 Current observation:
 
@@ -272,7 +353,7 @@ Default recommendation:
 
 Do not use `--stabilize-subspace-z` unless the experiment explicitly studies Z-side QR. The current stabilization experiment was negative.
 
-## 8. Slurm Template
+## 9. Slurm Template
 
 Use this as a starting point and edit only the experiment variable.
 
@@ -348,7 +429,29 @@ srun --mpi=pmix "$BIN" \
 echo "{Control/Experiment} complete!"
 ```
 
-## 9. AI Prompt Template
+For real-world input-file experiments, replace the synthetic matrix options:
+
+```bash
+--spectrum-decay-mode polynomial
+--spectrum-decay-param 0.6
+--spectrum-rank 8192
+--device-random-input
+```
+
+with:
+
+```bash
+--input-file testcases_real_world/{dataset}/matrix.f32
+```
+
+and keep the matching:
+
+```bash
+--m <rows>
+--n <cols>
+```
+
+## 10. AI Prompt Template
 
 Teammates can use this prompt with an AI assistant:
 
@@ -395,7 +498,15 @@ Update the experiment README with:
 - concise conclusion
 ```
 
-## 10. Common Pitfalls
+For real-world input-file logs, replace `theoretical` / `error ratio` with:
+
+```text
+- Final Reconstruction Error mean/min/stddev
+- Delta vs no-compression baseline
+- communication payload reduction
+```
+
+## 11. Common Pitfalls
 
 - Do not compare raw final error across different spectrum parameters without also comparing `Error Ratio`.
 - Do not use `spectrum_rank = 1024` for main experiments unless intentionally studying low effective rank.
@@ -404,9 +515,12 @@ Update the experiment README with:
 - Do not enable `B Relative Error` by default; use `--check-b-error` only for compression diagnostics.
 - Do not interpret q=2 as automatically better than q=1. Current experiments show q=1 is better.
 - Do not use `--stabilize-subspace-z` by default.
+- Do not use `--device-random-input` with `--input-file`.
+- Do not report real-world `err ratio` unless a true singular-spectrum baseline was computed.
+- Do not commit large generated `.f32` matrices or raw dataset/model cache files unless explicitly agreed.
 - Do not submit Slurm jobs from AI unless the human explicitly asks for it.
 
-## 11. Checklist Before Handing Back to Human
+## 12. Checklist Before Handing Back to Human
 
 Before saying the experiment setup is ready, the AI should verify:
 
@@ -417,5 +531,7 @@ Before saying the experiment setup is ready, the AI should verify:
 - `repeat = 50`.
 - `spectrum_rank = 8192` for the standard 32k x 8k setup.
 - `spectrum-decay-param = 0.6` for the first-pass TQ stress test, unless intentionally sweeping p.
+- For input-file experiments, `--input-file` exists and `--device-random-input` is absent.
+- For real-world experiments, the README does not rely on theoretical/error-ratio metrics.
 - The manipulated variable is the only intended difference between control and experiment.
 - The AI did not submit any Slurm job unless explicitly instructed.

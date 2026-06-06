@@ -20,8 +20,9 @@ The project currently focuses on:
 
 1. Building a realistic randomized SVD baseline with controllable singular spectra.
 2. Measuring whether subspace iteration improves accuracy enough to justify its extra communication.
-3. Applying TurboQuant to communication-heavy stages, starting with `B_i = Q_i^T A_i` reduce and likely extending to subspace iteration communication.
+3. Applying TurboQuant to communication-heavy stages, including both `B_i = Q_i^T A_i` reduce and subspace iteration `Z_i = A_i^T Q_i` reduce.
 4. Validating that our practical RHT rotation is a reasonable replacement for dense random rotation.
+5. Moving beyond synthetic matrices by supporting raw `.f32` input files for real-world OISST / POD / LoftQ-style testcases.
 
 Platform:
 
@@ -72,6 +73,7 @@ Important communication costs:
 |---|---:|---|
 | TSQR `R_i` gather | `O(l^2)` | small |
 | `B_i` reduce | `O(nl)` | large; original TurboQuant target |
+| subspace `Z_i` reduce | `O(nl)` | large when `q > 0`; current second TurboQuant target |
 | broadcast `Utilde` | `O(lk)` | small |
 
 ## 3. Subspace Iteration
@@ -95,6 +97,29 @@ repeat q times:
 ```
 
 This means each subspace iteration adds another communication-heavy `n x l` reduce, comparable in size to the `B_i` reduce. Therefore, once subspace iteration is enabled, compressing only `B_i` is no longer enough: the subspace iteration `Z` communication can become an equally important compression target.
+
+v4 now supports compressing this subspace `Z` communication path with the same compression interface used by `B`:
+
+```bash
+--compress-subspace-mode none|lowbit|tq|tq-qjl
+--compress-subspace-bits <bits>
+```
+
+Current TurboQuant experiments generally compare:
+
+```text
+No TQ:
+  compress-b-mode = none
+  compress-subspace-mode = none
+
+TQ8:
+  compress-b-mode = tq, compress-b-bits = 8
+  compress-subspace-mode = tq, compress-subspace-bits = 8
+
+TQ4:
+  compress-b-mode = tq, compress-b-bits = 4
+  compress-subspace-mode = tq, compress-subspace-bits = 4
+```
 
 There is also an experimental stabilized variant:
 
@@ -150,7 +175,47 @@ Current default:
 spectrum_rank = min(m, n)
 ```
 
-## 5. Accuracy Metric
+Synthetic spectra are still the preferred way to isolate accuracy behavior because the theoretical best rank-k error is known.
+
+## 5. External Input File Mode
+
+v4 now supports reading a real matrix `A` from a raw FP32 file:
+
+```bash
+--input-file <path>
+```
+
+Required file format:
+
+```text
+raw float32 binary
+row-major layout
+no header
+file size = m * n * sizeof(float)
+```
+
+The shape is still specified by the existing CLI parameters:
+
+```bash
+--m <rows>
+--n <cols>
+--input-file testcases_real_world/OISST/matrix.f32
+```
+
+Implementation behavior:
+
+- `--input-file` makes the matrix source `file`.
+- Each MPI rank / GPU reads only its assigned row block using file seek.
+- The host row-major block is converted to the local column-major layout expected by cuBLAS before copying to `w.d_Ai`.
+- `||A||_F^2` is computed from the file data with double/long-double accumulation and combined with MPI.
+- File loading and row-major to column-major conversion are setup work and are not counted in `Total Time`.
+- Repeat runs keep `A` fixed and only regenerate/copy randomized SVD `Omega`.
+- Synthetic spectrum options are ignored in file mode.
+- `--input-file` is mutually exclusive with `--device-random-input`.
+
+Because real input files do not provide an analytic singular spectrum, theoretical error and error ratio are reported as `n/a` in file mode. Use raw `Final Reconstruction Error` and comparison against the no-compression baseline for real-world datasets.
+
+## 6. Accuracy Metric
 
 The reported final reconstruction error is a fast Frobenius relative error estimate:
 
@@ -182,7 +247,24 @@ err ratio = mean final reconstruction error / theoretical error
 
 Because the theoretical error is constant for a fixed experiment configuration, this is equivalent to averaging per-repeat error ratios.
 
-Timing-only runs print only `Total Time`. Final-error runs print only accuracy metrics.
+Timing-only runs print timing / communication summaries. Final-error runs print accuracy metrics.
+
+Recommended experiment pattern:
+
+```text
+Timing phase:
+  add --no-check-error
+  record Total Time, GPU Compute Time, Host/Staging Time, NVLink/InfiniBand time, payloads
+
+Final-error phase:
+  do not add --no-check-error
+  record Final Reconstruction Error, theoretical, err ratio
+  optionally add --check-b-error for B compression diagnostics
+```
+
+For real-world `--input-file` runs, theoretical and err ratio are `n/a`; record raw `Final Reconstruction Error` instead.
+
+`Global B Relative Error` is a compression diagnostic. It is useful when studying compression damage to the intermediate `B` matrix, but it is not a primary final accuracy metric.
 
 ### Current Experiment Settings
 
@@ -213,7 +295,7 @@ The current v4 experiments intentionally changed several settings from the earli
      ```
    - This makes experiments comparable across different spectrum decay parameters.
 
-## 6. TurboQuant / RHT Status
+## 7. TurboQuant / RHT Status
 
 TurboQuant compresses each column of communication payloads by:
 
@@ -251,9 +333,59 @@ Generated figure:
 /work/pbr03617/turboquant-multigpu-svd/docs/notes/rht-distribution-test/rht_distribution.png
 ```
 
-## 7. Current Experimental Results
+### Current TurboQuant Status
 
-### 7.1 Subspace Iteration
+TurboQuant is now applied to:
+
+```text
+B reduce:
+  B = sum_i Q_i^T A_i
+
+Subspace iteration reduce:
+  Z = sum_i A_i^T Q_i
+```
+
+The current default good configuration is pure TQ 8-bit on both paths. TQ 4-bit can be faster but has a visible accuracy cost. TQ-QJL has been tested as a residual correction path and is currently a negative result: the extra GPU compute cost has not beaten pure TQ at the same bit setting.
+
+Reference experiment folder:
+
+```text
+exp_turboquant/
+```
+
+Representative synthetic setup:
+
+```text
+m = 65536
+n = 16384
+k = 250
+oversample = 6
+l = 256
+spectrum_decay_mode = polynomial
+spectrum_decay_param = 0.6
+spectrum_rank = 8192
+subspace_iter = 1
+repeat = 50
+```
+
+Observed high-level result:
+
+```text
+No TQ  -> Total Time about 187.7 ms, Error Ratio about 1.063
+TQ8    -> Total Time about 161.7 ms, Error Ratio about 1.063
+TQ4    -> Total Time about 137.9 ms, Error Ratio about 1.106
+QJL    -> negative result in current implementation
+```
+
+Interpretation:
+
+- TQ8 is the safest current default.
+- TQ4 is useful for speed-focused experiments but must be reported with accuracy cost.
+- QJL should not be included in the main TQ experiments unless explicitly requested.
+
+## 8. Current Experimental Results
+
+### 8.1 Subspace Iteration
 
 Experiment folder:
 
@@ -289,7 +421,7 @@ Interpretation:
 - Two iterations are worse than one in the current FP32 implementation with small oversampling.
 - The likely reason is that q=2 effectively amplifies singular values as roughly `sigma^(2q+1) = sigma^5`, which can over-emphasize the leading directions and numerically suppress rank-boundary directions near `k`.
 
-### 7.2 Z-Side Stabilization
+### 8.2 Z-Side Stabilization
 
 Experiment folder:
 
@@ -318,7 +450,7 @@ With Z stabilization:    45.35%
 
 Runtime also increased by about `15 ms`. Current decision: do not prioritize this path.
 
-## 8. Important Implementation Notes
+## 9. Important Implementation Notes
 
 Current useful CLI options:
 
@@ -333,6 +465,7 @@ Current useful CLI options:
 --qjl-dim
 --qjl-alpha
 --device-random-input
+--input-file <path>
 --skip-form-u
 --subspace-iter <q>
 --stabilize-subspace-z
@@ -365,6 +498,30 @@ randomized_svd_baseline_v4/
 │   ├── PROJECT_CONTEXT.md
 │   └── EXPERIMENT_GUIDELINE.md
 ├── .build/
+├── ai-prompts/
+├── testcases_real_world/
+│   ├── OISST/
+│   │   └── guideline.md
+│   ├── POD/
+│   │   └── guideline.md
+│   └── LoftQ/
+│       ├── guideline.md
+│       └── references/
+├── exp_synthetic_accuracy_scaling/
+│   ├── README.md
+│   ├── run_accuracy_sweep.slurm
+│   ├── run_scaling.slurm
+│   ├── output_logs/
+│   └── error_logs/
+├── exp_turboquant/
+│   ├── README.md
+│   ├── ctrl.slurm
+│   ├── b8-exp.slurm
+│   ├── b4-exp.slurm
+│   ├── b8-qjl-exp.slurm
+│   ├── b4-qjl-exp.slurm
+│   ├── output_logs/
+│   └── error_logs/
 ├── exp_subspace_iteration/
 │   ├── README.md
 │   ├── ctrl.slurm
@@ -380,52 +537,154 @@ randomized_svd_baseline_v4/
     └── error_logs/
 ```
 
-## 9. Main Next Steps
+## 10. Real-World Testcase Guidelines
 
-### 9.1 Validate TurboQuant on Subspace Iteration Communication
-
-Subspace iteration TQ is now implemented behind explicit CLI flags. The communication-heavy matrix is:
+The code can now consume real matrices through `--input-file`, so three real-world testcase guidelines have been added:
 
 ```text
-Z = sum_i A_i^T Q_i
+testcases_real_world/OISST/guideline.md
+testcases_real_world/POD/guideline.md
+testcases_real_world/LoftQ/guideline.md
 ```
 
-Its size is:
+All real-world testcases must produce:
 
 ```text
-n x l
+matrix.f32
+raw float32
+row-major
+no header
 ```
 
-This is the same asymptotic size as:
+Each testcase should also provide:
 
 ```text
-B = sum_i Q_i^T A_i
+meta.json
+README.md
+scripts/<prepare_script>.py
+exp_turboquant/
+output_logs/
+error_logs/
 ```
 
-Therefore, if `--subspace-iter` is enabled, compressing only `B_i` leaves a major communication cost untouched. The implementation now supports compressing this `Z` path through:
+Large generated matrices, raw NetCDF/HDF5/model shards, and cache directories should not be committed unless explicitly agreed.
+
+### 10.1 OISST
+
+Goal:
 
 ```text
---compress-subspace-mode tq
---compress-subspace-bits 4
+Sea surface temperature anomaly matrix for EOF/PCA/SVD.
 ```
 
-Implementation note:
+Matrix meaning:
 
 ```text
-Each MPI rank compresses its local Z contribution, all ranks exchange compressed payloads, and each rank decodes/accumulates the global Z on GPU0 before computing Y_i = A_i Z.
+rows    = selected ocean grid points
+columns = daily time snapshots
+entry   = SST anomaly after temporal mean removal
 ```
 
-Questions to answer experimentally:
+Target shape:
 
-- What is the effect on final reconstruction error?
-- How much runtime is saved versus the added encode/decode cost?
-- Does q=1 + TQ on both `Z` and `B` give a better speed/accuracy tradeoff than q=0 + TQ only on `B`?
+```text
+32768 x 8192
+```
 
-### 9.2 Run TurboQuant Experiments on v4 Synthetic Spectra
+### 10.2 POD / JHTDB CFD
 
-This is likely the next task for teammates.
+Goal:
 
-Recommended starting experiment:
+```text
+CFD/turbulence snapshot matrix for Proper Orthogonal Decomposition.
+```
+
+Current status:
+
+```text
+First perform feasibility check for JHTDB datasets:
+  isotropic1024coarse
+  transition_bl
+```
+
+Preferred matrix:
+
+```text
+rows    = 32 x 32 x 32 spatial points
+columns = time snapshots
+entry   = one velocity component or pressure fluctuation
+```
+
+Target shape:
+
+```text
+32768 x 4096
+```
+
+Fallback if time-resolved access is not feasible:
+
+```text
+Spatial patch matrix from a single turbulence snapshot.
+```
+
+### 10.3 LoftQ-Inspired LLM Residual
+
+Goal:
+
+```text
+LLM quantization residual matrix inspired by LoftQ.
+```
+
+Matrix definition:
+
+```text
+R = W - Q(W)
+```
+
+where `W` is one dense LLM weight tensor and `Q(W)` is the dequantized low-bit quantized version of that tensor.
+
+This is not a full LoftQ reproduction and should not be described as LoRA training. It is a real AI matrix benchmark for distributed rSVD on a quantization residual.
+
+Preferred first target:
+
+```text
+Mistral-7B
+model.layers.0.mlp.gate_proj.weight
+approx shape: 14336 x 4096
+```
+
+Debug target:
+
+```text
+TinyLlama-1.1B
+model.layers.0.mlp.gate_proj.weight
+approx shape: 5632 x 2048
+```
+
+## 11. Current Synthetic Experiment Plan
+
+Experiment folder:
+
+```text
+exp_synthetic_accuracy_scaling/
+```
+
+Scripts:
+
+```text
+run_accuracy_sweep.slurm
+run_scaling.slurm
+```
+
+### 11.1 Synthetic Accuracy Sweep
+
+Purpose:
+
+```text
+Measure TQ accuracy inflation across polynomial spectrum difficulty.
+```
+
+Fixed setup:
 
 ```text
 m = 32768
@@ -433,63 +692,55 @@ n = 8192
 k = 250
 oversample = 6
 spectrum = polynomial
-spectrum_decay_param = 0.6
+spectrum_decay_param = swept
 spectrum_rank = 8192
 subspace_iter = 1
 repeat = 50
 ```
 
-Recommended TQ sweep:
+Sweep:
 
 ```text
 spectrum_decay_param = 0.4, 0.6, 0.8, 1.0
+method = No TQ, TQ8, TQ4
 ```
 
-Use `0.6` as the first-pass stress-test config. Keep `1.0` as an easier sanity check, not the only reported setting.
-
-Compare:
+Main derived metrics:
 
 ```text
-control:
-  compress-b-mode = none
-  compress-subspace-mode = none
-
-B-only TQ:
-  compress-b-mode = tq, compress-b-bits = 4 or 2
-  compress-subspace-mode = none
-
-subspace-only TQ:
-  compress-b-mode = none
-  compress-subspace-mode = tq, compress-subspace-bits = 4
-
-B + subspace TQ:
-  compress-b-mode = tq, compress-b-bits = 4 or 2
-  compress-subspace-mode = tq, compress-subspace-bits = 4 or 2
+Speedup = Total Time_NoTQ / Total Time_TQ
+Error Inflation = Error Ratio_TQ / Error Ratio_NoTQ
 ```
 
-Metrics to record:
+### 11.2 Synthetic Matrix-Size Scaling
 
-- Total Time mean / min / stddev
-- Final Reconstruction Error mean / min / stddev
-- Theoretical error
-- Error ratio
-- Payload size / compression ratio if available in detailed logs
+Purpose:
 
-Suggested interpretation:
+```text
+Measure whether TQ speedup grows with matrix size.
+```
 
-- TQ 4-bit is expected to be the useful tradeoff.
-- TQ 2-bit is expected to be faster but may damage accuracy heavily.
-- If q=1 is used, B-only compression may not show the full possible speedup because subspace iteration `Z` communication can be comparable to the `B` reduce.
+Current planned sizes:
 
-## 10. Known Issues / Open Questions
+```text
+16384 x 4096, p = 0.6
+32768 x 8192, p = 0.6
+```
+
+The `32768 x 8192, p=0.6` point is already included in the accuracy sweep and should be reused unless rerun is necessary.
+
+Do not include QJL in this experiment unless explicitly requested.
+
+## 12. Known Issues / Open Questions
 
 - q=2 is worse than q=1 in current FP32 experiments.
 - Z-side QR stabilization did not help.
 - QJL residual correction remains a negative result in the current implementation.
-- TQ is currently applied to `B` reduce, not yet to subspace iteration `Z` reduce.
-- More experiment guidelines are needed so teammates can run TQ tests consistently.
+- The fast final reconstruction metric is still an estimate based on the produced singular values; for real input files use it as a practical quality metric, not an analytic optimum comparison.
+- For real-world datasets, theoretical error / err ratio are unavailable unless the true singular spectrum is separately computed.
+- More real-world preprocessing scripts are still needed for OISST, POD/JHTDB, and LoftQ-inspired residual matrices.
 
-## 11. References
+## 13. References
 
 | Reference | Used for |
 |---|---|
