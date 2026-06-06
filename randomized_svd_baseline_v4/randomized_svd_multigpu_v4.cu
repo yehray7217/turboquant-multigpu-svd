@@ -1411,7 +1411,7 @@ int main(int argc, char** argv) {
         repeat_global_b_relative_error.reserve(opt.repeat);
         repeat_final_error.reserve(opt.repeat);
         const bool vary_seed_per_repeat = opt.check_error || opt.check_b_error;
-        const bool report_timing_summary = !opt.check_error;
+        const bool report_timing_summary = true;
 
         for (int repeat_idx = 0; repeat_idx < opt.repeat; ++repeat_idx) {
         const unsigned repeat_seed = vary_seed_per_repeat ?

@@ -1,14 +1,14 @@
 #!/bin/bash
-#SBATCH --job-name=v4_tq_n_grid
+#SBATCH --job-name=v4_tq4_1node_scale
 #SBATCH --account=ACD115064
 #SBATCH --partition=nycugpu_queue
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=32
-#SBATCH --gpus-per-node=8
+#SBATCH --cpus-per-task=16
+#SBATCH --gpus-per-node=4
 #SBATCH --time=01:00:00
-#SBATCH --output=tq_n_grid_8gpu_%j.out
-#SBATCH --error=tq_n_grid_8gpu_%j.err
+#SBATCH --output=tq4_none_n_grid_1node_scaling_%j.out
+#SBATCH --error=tq4_none_n_grid_1node_scaling_%j.err
 
 set -euo pipefail
 
@@ -25,24 +25,21 @@ BIN="${PROJECT_ROOT}/.build/randomized_svd_multigpu_v4"
 cd "$PROJECT_ROOT"
 make
 
-cd "${PROJECT_ROOT}/exp_tq4_none_n_grid"
+cd "${PROJECT_ROOT}/exp_tq4_none_n_grid_1node_scaling"
 
 MATRIX_M="${MATRIX_M:-65536}"
 N_START="${N_START:-16384}"
 N_STOP="${N_STOP:-327680}"
 N_STEP="${N_STEP:-16384}"
 REPEAT="${REPEAT:-5}"
-NGPUS="${NGPUS:-8}"
-GPUS_PER_RANK="${GPUS_PER_RANK:-8}"
+GPU_COUNTS="${GPU_COUNTS:-1 2 4}"
+ERROR_MODE="${ERROR_MODE:-none}"
 CHECK_B_ERROR="${CHECK_B_ERROR:-0}"
-ERROR_MODE="${ERROR_MODE:-final}"
 
 COMMON_ARGS=(
     --m "${MATRIX_M}"
     --k 250
     --oversample 6
-    --ngpus "${NGPUS}"
-    --gpus-per-rank "${GPUS_PER_RANK}"
     --seed 1234
     --spectrum-decay-mode polynomial
     --spectrum-decay-param 0.6
@@ -67,18 +64,21 @@ fi
 run_case() {
     local label="$1"
     local n="$2"
-    local b_mode="$3"
-    local b_bits="$4"
-    local z_mode="$5"
-    local z_bits="$6"
+    local gpu_count="$3"
+    local b_mode="$4"
+    local b_bits="$5"
+    local z_mode="$6"
+    local z_bits="$7"
 
     echo "====================================="
-    echo "GRID_CASE method=${label} m=${MATRIX_M} n=${n} repeat=${REPEAT} ngpus=${NGPUS}"
+    echo "GRID_CASE method=${label} nodes=1 mpi_ranks=1 m=${MATRIX_M} n=${n} repeat=${REPEAT} ngpus=${gpu_count}"
     echo "Date: $(date)"
 
-    srun --mpi=pmix "$BIN" \
+    srun --mpi=pmix --ntasks=1 "$BIN" \
         "${COMMON_ARGS[@]}" \
         --n "${n}" \
+        --ngpus "${gpu_count}" \
+        --gpus-per-rank "${gpu_count}" \
         --compress-b-mode "${b_mode}" \
         --compress-b-bits "${b_bits}" \
         --compress-subspace-mode "${z_mode}" \
@@ -86,17 +86,17 @@ run_case() {
         --repeat "${REPEAT}"
 }
 
-echo "v4 TQ n-grid timing/error"
+echo "v4 1-node 1/2/4-GPU NONE/TQ4 n-grid"
 echo "Host: $(hostname)"
 echo "SLURM_JOB_NODELIST=${SLURM_JOB_NODELIST}"
-echo "MATRIX_M=${MATRIX_M} N_START=${N_START} N_STOP=${N_STOP} N_STEP=${N_STEP} REPEAT=${REPEAT} ERROR_MODE=${ERROR_MODE} CHECK_B_ERROR=${CHECK_B_ERROR}"
+echo "MATRIX_M=${MATRIX_M} N_START=${N_START} N_STOP=${N_STOP} N_STEP=${N_STEP} REPEAT=${REPEAT} GPU_COUNTS=${GPU_COUNTS} ERROR_MODE=${ERROR_MODE} CHECK_B_ERROR=${CHECK_B_ERROR}"
 nvidia-smi -L
 
 for ((n = N_START; n <= N_STOP; n += N_STEP)); do
-    run_case "none" "${n}" "none" 0 "none" 0
-    run_case "TQ4" "${n}" "tq" 4 "tq" 4
-    run_case "TQ2" "${n}" "tq" 2 "tq" 2
-    run_case "TQ1" "${n}" "tq" 1 "tq" 1
+    for gpu_count in ${GPU_COUNTS}; do
+        run_case "none" "${n}" "${gpu_count}" "none" 0 "none" 0
+        run_case "TQ4" "${n}" "${gpu_count}" "tq" 4 "tq" 4
+    done
 done
 
-echo "n-grid timing complete."
+echo "1-node scaling n-grid complete."

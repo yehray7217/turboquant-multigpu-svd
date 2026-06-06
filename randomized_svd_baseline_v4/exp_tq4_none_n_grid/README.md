@@ -28,13 +28,17 @@ QJL is intentionally excluded.
 | input | device-random synthetic matrix |
 | spectrum | polynomial, param `0.6`, rank `8192` |
 | repeat | 5 |
-| final reconstruction error | skipped |
-| B compression error | enabled by default |
+| final reconstruction error | enabled by default |
+| B compression error | disabled by default |
 
-The run skips final reconstruction error because this is a timing curve across
-20 matrix sizes and 4 methods. It enables `--check-b-error` by default so TQ1
-and TQ2 report their local/global `B` relative error while keeping the timing
-summary available.
+The run enables final reconstruction error by default because this grid is used
+to compare end-to-end randomized SVD quality. B-compression error is a separate
+diagnostic and is disabled by default to avoid confusing it with final error.
+
+For compressed runs, the final reconstruction metric is
+`compressed_safe_projected_space`: it recomputes the small SVD on compressed
+`B` and estimates the final randomized-SVD reconstruction error without forming
+the full `A_hat = U S V^T` on host.
 
 ## Run
 
@@ -52,7 +56,19 @@ REPEAT=10 N_START=16384 N_STOP=327680 N_STEP=16384 sbatch run_tq4_none_n_grid_8g
 To disable B-error checks for a pure timing pass:
 
 ```bash
-CHECK_B_ERROR=0 sbatch run_tq4_none_n_grid_8gpu.slurm
+ERROR_MODE=none CHECK_B_ERROR=0 sbatch run_tq4_none_n_grid_8gpu.slurm
+```
+
+To also include B-compression diagnostics:
+
+```bash
+CHECK_B_ERROR=1 sbatch run_tq4_none_n_grid_8gpu.slurm
+```
+
+To run only B-compression error and skip final reconstruction error:
+
+```bash
+ERROR_MODE=b sbatch run_tq4_none_n_grid_8gpu.slurm
 ```
 
 ## Summarize
@@ -68,11 +84,11 @@ cat tq_n_grid_8gpu_<jobid>.csv
 The CSV columns are:
 
 ```text
-method,matrix_size,m,n,gpu,repeat,total_ms,speedup_vs_none,host_gpu_mib,nvlink_mib,ib_mib,global_b_rel_error_pct,local_bi_rel_error_pct
+method,matrix_size,m,n,gpu,repeat,total_ms,speedup_vs_none,host_gpu_mib,nvlink_mib,ib_mib,final_reconstruction_error,global_b_rel_error_pct,local_bi_rel_error_pct
 ```
 
 ## Notes
 
-This is still primarily a scaling/timing experiment. The error columns are B
-compression error, not final reconstruction error. Use a smaller fixed-size
-validation run with final error enabled if you need full end-to-end accuracy.
+`final_reconstruction_error` is the end-to-end randomized SVD quality column.
+`global_b_rel_error_pct` and `local_bi_rel_error_pct` are diagnostic columns for
+the B compression step only.
