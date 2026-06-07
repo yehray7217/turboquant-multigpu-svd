@@ -1,0 +1,8 @@
+matrix*.f32
+meta*.json
+.venv/
+raw_data/
+cache/
+*.nc
+*.nc4
+*.hdf5

@@ -6,7 +6,7 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=32
 #SBATCH --gpus-per-node=8
-#SBATCH --time=02:00:00
+#SBATCH --time=01:00:00
 #SBATCH --output=/work/pbr03617/turboquant-multigpu-svd/randomized_svd_baseline_v4/exp_synthetic_accuracy_scaling/output_logs/scaling_%j.out
 #SBATCH --error=/work/pbr03617/turboquant-multigpu-svd/randomized_svd_baseline_v4/exp_synthetic_accuracy_scaling/error_logs/scaling_%j.err
 
@@ -111,5 +111,8 @@ else
     echo "Skipping duplicate 32768x8192 p=0.6 point; reuse the Experiment A p=0.6 results."
     echo "Set RUN_DUPLICATE_32K=1 to rerun it in this script."
 fi
+
+run_size 65536 16384 16384
+run_size 131072 32768 32768
 
 echo "Synthetic scaling experiment complete."

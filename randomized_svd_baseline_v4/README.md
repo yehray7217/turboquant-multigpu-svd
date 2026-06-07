@@ -2,6 +2,40 @@
 
 > Note: 可以直接把 `turboquant-multigpu-svd/randomized_svd_baseline_v4/skills/PROJECT_CONTEXT.md` 拿去餵給 AI，讓它 follow up 最新的進度。
 
+# 06/07
+
+## 修復 multi-node TSQR 的 `MPI_Gather` layout bug
+
+在導入 OISST real-world testcase 後，發現 16GPU / 2-node 的 no-compression rSVD accuracy 明顯比 Python / 1GPU sanity check 差：
+
+| case | q | Final Reconstruction Error |
+|---|---:|---:|
+| Python blockwise rSVD | 0 | 20.8166% |
+| CUDA 1GPU rSVD | 0 | 20.8236% |
+| CUDA 16GPU rSVD（修復前） | 0 | 27.4764% |
+| CUDA 16GPU rSVD（修復後） | 0 | 20.8236% |
+
+Root cause 是 multi-rank TSQR 在收集各 rank 的 local `Rstack` 時，直接用 `MPI_Gather` 收到 root 的 buffer：
+
+```text
+rank 0 column-major Rstack block
+rank 1 column-major Rstack block
+...
+```
+
+但 cuSOLVER 後續把這個 buffer 當作一個完整的 global column-major matrix 來做 QR。也就是說，`MPI_Gather` 得到的是 rank-major contiguous layout，不是 cuSOLVER 需要的 global column-major layout，導致 stacked-R 的排列錯誤，進而讓 global TSQR 形成的 `Q` 變差。
+
+修復方式：
+
+- 新增 `stitch_rank_major_column_stacks(...)`
+- `MPI_Gather` 先收進 rank-major temporary buffer
+- root 再將 gathered buffer 重排成 global column-major `Rstack`
+- 同時修復 initial TSQR 與 subspace iteration 內第二次 TSQR 的 gather path
+
+這個 bug 只會出現在 `mpi_size > 1` 的 TSQR path。1GPU 不會走 `MPI_Gather`，所以 1GPU 結果原本就是正常的。
+
+驗證結果：修復後 16GPU q=0 的 OISST debug matrix error 從 `27.4764%` 回到 `20.8236%`，與 Python blockwise rSVD 和 CUDA 1GPU sanity check 對齊。
+
 # 05/30
 
 ## 修好 QJL
