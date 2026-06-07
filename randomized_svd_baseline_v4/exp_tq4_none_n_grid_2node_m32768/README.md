@@ -92,25 +92,66 @@ mode `final_reconstruction_error` is left blank.
 
 ## Results
 
-Timing-only by default. Fill in after running (one row per `n`, comparing the
-two methods); `final_reconstruction_error` only populated when `ERROR_MODE=final`.
+Timing-only run (`ERROR_MODE=none`, `repeat=5`), Taiwania 2 `nycugpu_queue`,
+2 nodes x 8 V100, account ACD115064, job 947279. Source:
+`tq4_none_n_grid_2node_m32768_947279.out` -> `.csv` via
+`summarize_n_grid_2node_m32768.py`. `Speedup = NONE total_ms / TQ4 total_ms`
+(warm means). Payload cells show `NONE -> TQ4` (MiB).
 
-| n | NONE total (ms) | TQ4 total (ms) | Speedup | Host-GPU payload (MiB) | NVLink payload (MiB) | InfiniBand payload (MiB) |
+> Hardware cap: the full sweep was capped at **n = 458752**. The B/Z reduce
+> gathers all 15 peer `l x n` blocks onto GPU 0, so GPU-0 memory grows ~O(n);
+> on the 32 GB V100s every `n >= 475136` (i.e. 475136, 491520, ..., 655360)
+> hits CUDA out-of-memory at `randomized_svd_multigpu_v4.cu:1153`. The reachable
+> grid is therefore the 28 points `16384 ... 458752`.
+
+| n | NONE total (ms) | TQ4 total (ms) | Speedup | Host-GPU MiB (NONE->TQ4) | NVLink MiB (NONE->TQ4) | InfiniBand MiB (NONE->TQ4) |
 |---:|---:|---:|---:|---:|---:|---:|
-| 16384 | | | | | | |
-| 32768 | | | | | | |
-| 49152 | | | | | | |
-| ... | | | | | | |
-| 655360 | | | | | | |
+| 16384 | 174 | 94 | 1.85x | 368->117 | 448->282 | 80->24 |
+| 32768 | 359 | 149 | 2.40x | 704->201 | 896->564 | 144->32 |
+| 49152 | 512 | 199 | 2.57x | 1040->286 | 1344->845 | 208->41 |
+| 65536 | 666 | 254 | 2.62x | 1376->370 | 1792->1127 | 272->49 |
+| 81920 | 829 | 311 | 2.66x | 1712->455 | 2240->1409 | 336->57 |
+| 98304 | 994 | 362 | 2.75x | 2048->540 | 2688->1690 | 400->66 |
+| 114688 | 1150 | 420 | 2.74x | 2384->624 | 3136->1972 | 464->74 |
+| 131072 | 1305 | 491 | 2.66x | 2720->709 | 3584->2254 | 528->82 |
+| 147456 | 1469 | 543 | 2.70x | 3056->794 | 4032->2536 | 592->90 |
+| 163840 | 1638 | 593 | 2.76x | 3392->878 | 4480->2818 | 656->98 |
+| 180224 | 1789 | 658 | 2.72x | 3728->963 | 4928->3099 | 720->107 |
+| 196608 | 1947 | 688 | 2.83x | 4064->1048 | 5376->3381 | 784->115 |
+| 212992 | 2091 | 769 | 2.72x | 4400->1132 | 5824->3663 | 848->123 |
+| 229376 | 2252 | 816 | 2.76x | 4736->1217 | 6272->3944 | 912->132 |
+| 245760 | 2400 | 887 | 2.71x | 5072->1301 | 6720->4226 | 976->140 |
+| 262144 | 2545 | 959 | 2.65x | 5408->1386 | 7168->4508 | 1040->148 |
+| 278528 | 2718 | 1017 | 2.67x | 5744->1471 | 7616->4790 | 1104->156 |
+| 294912 | 2905 | 1080 | 2.69x | 6080->1555 | 8064->5072 | 1168->164 |
+| 311296 | 3018 | 1130 | 2.67x | 6416->1640 | 8512->5353 | 1232->173 |
+| 327680 | 3160 | 1195 | 2.64x | 6752->1724 | 8960->5635 | 1296->181 |
+| 344064 | 3365 | 1243 | 2.71x | 7088->1809 | 9408->5917 | 1360->189 |
+| 360448 | 3474 | 1306 | 2.66x | 7424->1894 | 9856->6198 | 1424->198 |
+| 376832 | 3663 | 1365 | 2.68x | 7760->1978 | 10304->6480 | 1488->206 |
+| 393216 | 3811 | 1396 | 2.73x | 8096->2063 | 10752->6762 | 1552->214 |
+| 409600 | 3975 | 1478 | 2.69x | 8432->2148 | 11200->7044 | 1616->222 |
+| 425984 | 4116 | 1534 | 2.68x | 8768->2232 | 11648->7326 | 1680->230 |
+| 442368 | 4259 | 1590 | 2.68x | 9104->2317 | 12096->7607 | 1744->239 |
+| 458752 | 4479 | 1617 | 2.77x | 9440->2402 | 12544->7889 | 1808->247 |
 
-> Payload columns above are for whichever method you tabulate; the CSV reports
-> Host-GPU / NVLink / InfiniBand payload per method, so you can compare NONE vs
-> TQ4 payload directly and confirm the ~O(n) growth of the compressed reduce.
+## Conclusion
 
-## Expected story
+**The TQ4 speedup rises steeply, then converges.** It climbs from 1.85x at
+`n=16384` to ~2.7x by `n~=96k`, then plateaus in a 2.64x-2.83x band for the rest
+of the sweep (no sustained upward trend out to `n=458752`). So as the `O(nl)`
+communication payload grows, TQ4's benefit saturates rather than growing without
+bound: once the compressed reduce dominates total time, both NONE and TQ4 scale
+linearly in `n`, fixing the ratio at the inverse of the reduce's compression
+factor plus the remaining uncompressed/compute terms.
 
-If TQ4 compresses the `O(nl)` reduce traffic, its speedup over NONE should
-**increase with `n`** as communication takes a larger share of total time, then
-**converge** once the reduce dominates and the fixed compute/quantization
-overheads become negligible. This experiment checks whether the speedup is still
-climbing at `n = 640k` or has already flattened.
+This is consistent with the payload numbers: InfiniBand payload (the inter-node
+reduce) is cut ~3.3x at small `n` and ~7x at large `n` (the per-step `O(nl)` part
+shrinks faster than fixed overheads), while NVLink payload is only cut ~1.6x
+(intra-node traffic includes uncompressed pieces). The end-to-end ~2.7x reflects
+the blend of these compressed and uncompressed stages.
+
+Note this is a much larger speedup than the ~1.6x seen in the balanced
+matrix-size scaling (where `m` and `n` grow together): holding `m` fixed makes
+the `O(nl)` reduce payload the dominant cost sooner, so communication
+compression has more to bite on.
