@@ -57,7 +57,7 @@ The scripts run two phases for each config:
 
 ```text
 run_accuracy_sweep.slurm  -> p = 0.4, 0.6, 0.8, 1.0 at 32768 x 8192
-run_scaling.slurm         -> 16384 x 4096, 65536 x 16384, 131072 x 32768 at p = 0.6
+run_scaling.slurm         -> 16384 x 4096 at p = 0.6
 ```
 
 The `32768 x 8192, p=0.6` scaling point is reused from the accuracy sweep. Set `RUN_DUPLICATE_32K=1` when submitting `run_scaling.slurm` only if that duplicate point needs to be rerun.
@@ -120,11 +120,9 @@ with matrix size. TQ4 is faster (1.6x) but its accuracy cost is spectrum-depende
 slowly decaying spectra (p<=0.6) and unacceptable on fast-decaying spectra (p>=0.8, up to 2.6x
 error inflation at p=1.0). Recommended default: TQ8.
 
-
 ## Notes
 
 - Do not compare raw final error across different `p` without using Error Ratio.
 - Do not include QJL in this experiment.
 - Use summary output values, not manually estimated values from long logs.
 - For timing, use warm summary means and payload summaries from the `Timing Summary` / `Payload Summary` sections.
-- Keep `k=250`, `oversample=6`, and `l=256` fixed for matrix-size scaling. This keeps the scaling curve focused on matrix size only; experiments that vary `l` should be separate.
